@@ -12,7 +12,7 @@ mcp = FastMCP("UBS Stage 2")
 
 GRAPH_API_URL = os.environ.get(
     "GRAPH_API_URL",
-    "https://showdown-gcc2026-8096557b5962.herokuapp.com/graph"
+    "https://tool-box-2591eaa24fa3.herokuapp.com/graph"
 )
 graph_cache = {}
 
