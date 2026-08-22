@@ -6,7 +6,6 @@ import heapq
 import json
 import numpy as np
 import re
-import tiktoken
 from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlencode
 from urllib.request import urlopen
@@ -71,9 +70,8 @@ def load_study_materials():
 
 @mcp.tool()
 def retrieve(query: str) -> list[str]:
-    """Return relevant passages within the exact o200k_base 900-token budget."""
-    encoding = tiktoken.get_encoding("o200k_base")
-    max_output_tokens = 900
+    """Return complete, relevant sections within an approximately 900-token budget."""
+    max_output_chars = 3600
 
     def normalized_words(value):
         result = set()
@@ -171,22 +169,27 @@ def retrieve(query: str) -> list[str]:
 
     candidates.sort(key=lambda item: (item[0], len(item[3])), reverse=True)
     results = []
-    total_tokens = 0
+    total_length = 0
 
     def add_passage(passage):
-        nonlocal total_tokens
-        if not passage or passage in results or total_tokens >= max_output_tokens:
+        nonlocal total_length
+        if not passage or passage in results or total_length >= max_output_chars:
             return
 
-        remaining = max_output_tokens - total_tokens
-        passage_tokens = encoding.encode(passage)
-        if len(passage_tokens) > remaining:
-            passage = encoding.decode(passage_tokens[:remaining]).strip()
-            passage_tokens = encoding.encode(passage)
+        remaining = max_output_chars - total_length
+        if len(passage) > remaining:
+            if remaining < 300:
+                return
+            cut = passage.rfind(". ", 0, remaining)
+            if cut < remaining * 0.6:
+                cut = remaining
+            else:
+                cut += 1
+            passage = passage[:cut].strip()
 
         if passage:
             results.append(passage)
-            total_tokens += len(passage_tokens)
+            total_length += len(passage)
 
     if candidates:
         _, best_document, best_chunk, best_passage = candidates[0]
@@ -194,23 +197,23 @@ def retrieve(query: str) -> list[str]:
 
         distance = 1
         chunks = documents[best_document]
-        while total_tokens < max_output_tokens and (
+        while total_length < 3200 and (
             best_chunk - distance >= 0 or best_chunk + distance < len(chunks)
         ):
             if best_chunk - distance >= 0:
                 add_passage(chunks[best_chunk - distance][0])
-            if total_tokens < max_output_tokens and best_chunk + distance < len(chunks):
+            if total_length < 3200 and best_chunk + distance < len(chunks):
                 add_passage(chunks[best_chunk + distance][0])
             distance += 1
 
         for _, _, _, passage in candidates[1:]:
-            if total_tokens >= max_output_tokens:
+            if total_length >= 3200:
                 break
             add_passage(passage)
     else:
         for chunks in documents:
             for passage, _ in chunks:
-                if total_tokens >= max_output_tokens:
+                if total_length >= 3200:
                     break
                 add_passage(passage)
 
