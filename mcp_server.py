@@ -87,45 +87,96 @@ def load_study_materials():
 
 @mcp.tool()
 def retrieve(query: str) -> list[str]:
-    """Retrieve passages relevant to an exam question."""
-    words = {
-        word for word in re.findall(r"[a-z0-9]+", query.lower())
-        if len(word) > 2
-    }
+    """Return broad context from the study document most relevant to a question."""
+    max_output_chars = 3600
+
+    def normalized_words(value):
+        result = set()
+        for word in re.findall(r"[a-z0-9]+", value.lower()):
+            if len(word) <= 2:
+                continue
+            for suffix in ("ing", "ed", "es", "s"):
+                if word.endswith(suffix) and len(word) - len(suffix) >= 4:
+                    word = word[:-len(suffix)]
+                    break
+            result.add(word)
+        return result
+
+    words = normalized_words(query)
     stop_words = {
         "the", "and", "for", "was", "were", "what", "when", "where",
-        "which", "who", "how", "from", "with", "about", "into"
+        "which", "who", "how", "from", "with", "about", "into", "exact"
     }
     words -= stop_words
 
-    candidates = []
-    for text in load_study_materials():
-        sentences = re.split(r"(?<=[.!?])\s+|\n+", text)
-        for index, sentence in enumerate(sentences):
-            sentence_words = set(re.findall(r"[a-z0-9]+", sentence.lower()))
-            score = len(words & sentence_words)
-            if score:
-                start = max(0, index - 1)
-                end = min(len(sentences), index + 2)
-                passage = " ".join(sentences[start:end]).strip()
-                candidates.append((score, passage))
+    def split_into_chunks(text, limit=3200):
+        if len(text) <= limit:
+            return [text.strip()]
 
-    candidates.sort(key=lambda item: (item[0], len(item[1])), reverse=True)
+        sentences = re.split(r"(?<=[.!?])\s+|\n+", text)
+        title = sentences[0].strip()
+        chunks = []
+        start = 0
+        while start < len(sentences):
+            size = 0
+            end = start
+            while end < len(sentences):
+                added = len(sentences[end]) + 1
+                if end > start and size + added > limit:
+                    break
+                size += added
+                end += 1
+
+            chunk = " ".join(sentences[start:end]).strip()
+            if start and title not in chunk:
+                chunk = f"Document: {title}\n{chunk}"
+            if chunk:
+                chunks.append(chunk)
+            if end == len(sentences):
+                break
+            start = max(start + 1, end - 2)
+        return chunks
+
+    candidates = []
+    for document_number, text in enumerate(load_study_materials()):
+        for chunk in split_into_chunks(text):
+            chunk_words = normalized_words(chunk)
+            matches = words & chunk_words
+            if not matches:
+                continue
+            occurrences = sum(chunk.lower().count(word) for word in matches)
+            score = len(matches) * 10 + min(occurrences, 10)
+            candidates.append((score, document_number, chunk))
+
+    candidates.sort(key=lambda item: (item[0], len(item[2])), reverse=True)
     results = []
     total_length = 0
-    for _, passage in candidates:
+    best_score = candidates[0][0] if candidates else 0
+    chosen_documents = set()
+    for score, document_number, passage in candidates:
         if passage in results:
             continue
-        if total_length + len(passage) > 1800:
+        if results and score < best_score * 0.6:
+            continue
+        if total_length + len(passage) > max_output_chars:
             continue
         results.append(passage)
+        chosen_documents.add(document_number)
         total_length += len(passage)
-        if len(results) == 6:
+        if total_length >= 3000 or len(results) == 3:
             break
 
     if results:
         return results
-    return EXAM_PASSAGES[:2]
+
+    fallback = []
+    total_length = 0
+    for passage in EXAM_PASSAGES:
+        if total_length + len(passage) > max_output_chars:
+            break
+        fallback.append(passage)
+        total_length += len(passage)
+    return fallback
 
 
 def get_graph(map_id: str) -> dict:
