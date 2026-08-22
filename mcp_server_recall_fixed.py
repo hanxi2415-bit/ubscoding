@@ -103,6 +103,55 @@ def retrieve(query: str) -> list[str]:
         {"movement", "transition", "animation", "blending", "motion"},
         {"lead", "leader", "director", "head", "chair"},
         {"limit", "ceiling", "maximum", "max", "cap", "threshold"},
+        {"grain", "cereal", "crop"},
+        {"downgrade", "downgraded", "markdown", "quality", "grade", "graded"},
+        {"moisture", "humidity"},
+        {"percent", "percentage"},
+
+        {"resident", "residents", "population", "occupancy", "crew", "staff"},
+        {"ceiling", "limit", "maximum", "max", "cap", "threshold"},
+        {"resupply", "restock", "replenish", "provisions", "supplies"},
+        {"calibrate", "calibration", "recalibrate", "recalibrated", "adjustment"},
+        {"dive", "diver", "excursion", "underwater"},
+        {"scrubber", "ventilation", "oxygen", "air"},
+        {"flooding", "flood", "leak", "gasket"},
+
+        {"driver", "drivers", "motorman", "motormen", "operator", "operators"},
+        {"certified", "licensed", "qualified", "approved"},
+        {"fare", "price", "charge", "cost"},
+        {"cap", "ceiling", "maximum", "limit"},
+        {"shift", "duty", "work", "segment"},
+        {"break", "rest", "pause"},
+        {"line", "route", "corridor", "service"},
+        {"depot", "yard", "maintenance", "servicing"},
+
+        {"participant", "participants", "patient", "patients", "subject", "subjects"},
+        {"enroll", "enrolled", "enrollment", "recruit", "recruitment"},
+        {"dose", "dosing", "dosage", "regimen"},
+        {"adverse", "event", "reaction", "incident", "sideeffect"},
+        {"withdraw", "withdrawn", "withdrawal", "remove", "removed"},
+        {"enzyme", "alanine", "aminotransferase", "alt"},
+        {"bloodwork", "laboratory", "lab", "test"},
+        {"followup", "follow", "monitoring", "observation"},
+
+        {"release", "version", "build", "milestone"},
+        {"regression", "bug", "glitch", "issue", "fault"},
+        {"fixed", "patched", "resolved", "repaired"},
+        {"animation", "blending", "movement", "locomotion", "transition"},
+        {"renderer", "rendering", "graphics", "lighting"},
+        {"budget", "limit", "ceiling", "allowance"},
+        {"stall", "stalled", "delay", "timeout", "slow"},
+        {"texture", "memory", "streaming"},
+        {"certification", "submission", "shipping", "release"},
+
+        {"shipment", "delivery", "consignment", "load", "batch"},
+        {"grading", "grade", "quality", "classification", "rating"},
+        {"storage", "coldstore", "refrigerated", "refrigeration"},
+        {"harvest", "harvesting", "crop", "produce"},
+        {"member", "membership", "household", "shareholder"},
+        {"drier", "dryer", "drying"},
+        {"spoil", "spoiled", "spoilage", "rot"},
+        {"automatic", "automatically", "mandatory", "required"},
     ]
     normalized_groups = [
         set().union(*(normalized_words(word) for word in group))
@@ -391,6 +440,9 @@ def identify_shape(image_base64: str) -> str:
         return "rectangle"
     else:
         return "circle"
+
+app = mcp.http_app(path="/mcp")
+
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
