@@ -3,3 +3,4 @@ gunicorn
 fastmcp
 opencv-python-headless
 numpy
+requests
