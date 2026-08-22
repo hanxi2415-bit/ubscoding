@@ -72,11 +72,11 @@ def load_study_materials():
 
 
 @mcp.tool()
-def retrieve(query: str) -> str:
+def retrieve(query: str) -> list[str]:
     materials = load_study_materials()
 
     if not materials:
-        return "Unable to load study materials."
+        return []
 
     words = [
         word.lower().strip(".,?!:;()[]{}'\"")
@@ -93,37 +93,37 @@ def retrieve(query: str) -> str:
 
     scored.sort(key=lambda x: x[0], reverse=True)
 
-    result = ""
+    results = []
+    total_length = 0
 
     for score, text in scored:
         sentences = text.replace("\n", " ").split(".")
 
-        relevant = []
-
         for sentence in sentences:
-            sentence_lower = sentence.lower()
+            sentence = sentence.strip()
 
-            if any(word in sentence_lower for word in words):
-                relevant.append(sentence.strip())
-
-        for sentence in relevant:
             if not sentence:
                 continue
 
-            addition = sentence + ". "
+            sentence_lower = sentence.lower()
 
-            if len(result) + len(addition) > 900:
-                return result.strip()[:900]
+            if any(word in sentence_lower for word in words):
+                passage = sentence + "."
 
-            result += addition
+                if total_length + len(passage) > 900:
+                    return results
 
-        if len(result) >= 700:
+                results.append(passage)
+                total_length += len(passage)
+
+        if total_length >= 700:
             break
 
-    if not result:
-        return scored[0][1][:900]
+    if not results:
+        best = scored[0][1][:900]
+        return [best]
 
-    return result.strip()[:900]
+    return results
 
 def get_graph(map_id: str) -> dict:
     if map_id not in graph_cache:
