@@ -1,41 +1,49 @@
-from flask import Flask, jsonify, request
 from bisect import bisect_right
-import json
-import heapq
 from datetime import datetime, timedelta, timezone
+import heapq
+import json
+from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
 
-def solve_case(d):
-    start = tuple(d["start_coordinate"])
-    end = tuple(d["end_coordinate"])
-    t0 = datetime.fromisoformat(d["start_time"].replace("Z", "+00:00"))
-    fail = {"total_duration_sec": None, "arrival_time": None, "path": []}
+def solve_case(data):
+    start = tuple(data["start_coordinate"])
+    end = tuple(data["end_coordinate"])
+    start_time = datetime.fromisoformat(data["start_time"].replace("Z", "+00:00"))
 
-    graph = {tuple(node): [] for node in d["nodes"]}
+    unreachable = {"total_duration_sec": None, "arrival_time": None, "path": []}
+
+    graph = {tuple(node): [] for node in data["nodes"]}
     if start not in graph or end not in graph:
-        return fail
+        return unreachable
 
-    for edge in d["edges"]:
-        a, b = tuple(edge["node1"]), tuple(edge["node2"])
-        item = edge["edge_id"], edge["base_duration_sec"]
-        graph[a].append((b, *item))
-        graph[b].append((a, *item))
+    for edge in data["edges"]:
+        node1 = tuple(edge["node1"])
+        node2 = tuple(edge["node2"])
+        info = edge["edge_id"], edge["base_duration_sec"]
+        graph[node1].append((node2, *info))
+        graph[node2].append((node1, *info))
 
     blocks = {}
     max_speeds = {}
-    horizon = t0
-    for ob in d["obstructions"]:
-        edge = ob["edge"]
-        key = ob["edge_id"], tuple(edge["from"]), tuple(edge["to"])
+    horizon = 0.0
+    for obstruction in data["obstructions"]:
+        edge = obstruction["edge"]
+        key = obstruction["edge_id"], tuple(edge["from"]), tuple(edge["to"])
         interval = (
-            datetime.fromisoformat(ob["start_time"].replace("Z", "+00:00")),
-            datetime.fromisoformat(ob["end_time"].replace("Z", "+00:00")),
-            ob["speed_factor"],
+            (
+                datetime.fromisoformat(obstruction["start_time"].replace("Z", "+00:00"))
+                - start_time
+            ).total_seconds(),
+            (
+                datetime.fromisoformat(obstruction["end_time"].replace("Z", "+00:00"))
+                - start_time
+            ).total_seconds(),
+            obstruction["speed_factor"],
         )
         blocks.setdefault(key, []).append(interval)
-        max_speeds[key] = max(max_speeds.get(key, 1), ob["speed_factor"])
+        max_speeds[key] = max(max_speeds.get(key, 1), obstruction["speed_factor"])
         horizon = max(horizon, interval[1])
 
     for intervals in blocks.values():
@@ -58,18 +66,18 @@ def solve_case(d):
             if begin <= now < finish and factor == 0:
                 return None
             if now < begin:
-                span = (begin - now).total_seconds()
+                span = begin - now
                 if left <= span:
-                    return now + timedelta(seconds=left)
+                    return now + left
                 left -= span
                 now = begin
-            span = (finish - now).total_seconds()
+            span = finish - now
             if factor and left <= span * factor:
-                return now + timedelta(seconds=left / factor)
+                return now + left / factor
             left -= span * factor
             now = finish
 
-        return now + timedelta(seconds=left)
+        return now + left
 
     def reverse_dist(optimistic=False):
         result = {end: 0}
@@ -90,13 +98,11 @@ def solve_case(d):
                     heapq.heappush(queue, (new, near))
         return result, next_step
 
-    # Base distances are exact after the final obstruction. Optimistic distances
-    # remain valid lower bounds even when a speed_factor is greater than one.
     dist, follow = reverse_dist()
     lower, _ = reverse_dist(optimistic=True)
 
     if start not in dist:
-        return fail
+        return unreachable
 
     def tail(node):
         path = []
@@ -125,7 +131,7 @@ def solve_case(d):
         if state in seen or best and estimate >= best[0]:
             continue
         seen.add(state)
-        now = t0 + timedelta(seconds=elapsed)
+        now = elapsed
 
         if node == end:
             best = elapsed, prefix(label)
@@ -137,7 +143,7 @@ def solve_case(d):
             for near, edge_id, duration in graph[node]:
                 arrival = arrive(edge_id, node, near, duration, now)
                 if arrival is not None and near in dist:
-                    new = (arrival - t0).total_seconds()
+                    new = arrival
                     bound = new + lower[near]
                     if best is None or bound < best[0]:
                         serial += 1
@@ -145,15 +151,20 @@ def solve_case(d):
                         heapq.heappush(q, (bound, new, serial, near, serial))
 
     if best is None:
-        return fail
+        return unreachable
 
     duration, path = best
     duration = round(duration, 9)
     duration = int(duration) if duration.is_integer() else duration
     arrival = (
-        t0 + timedelta(seconds=duration)
+        start_time + timedelta(seconds=duration)
     ).astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
-    return {"total_duration_sec": duration, "arrival_time": arrival, "path": path}
+
+    return {
+        "total_duration_sec": duration,
+        "arrival_time": arrival,
+        "path": path
+    }
 
 
 def solve(data: str) -> str:
@@ -162,6 +173,8 @@ def solve(data: str) -> str:
 
 
 @app.route("/kan-cheong-delivery-driver", methods=["POST"])
-def solve_api():
-    batch = request.get_json(force=True)
-    return jsonify({case_id: solve_case(case) for case_id, case in batch.items()})
+def solve_endpoint():
+    body = request.get_json()
+    result = {case_id: solve_case(case) for case_id, case in body.items()}
+
+    return jsonify(result)
