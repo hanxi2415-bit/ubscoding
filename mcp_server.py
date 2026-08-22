@@ -12,18 +12,15 @@ def get_name() -> str:
     return "BabyBot"
 
 @mcp.tool
-def calculate(a: int, operator: str, b: int) -> float:
-    """Calculate a + b, a - b, a * b, or a / b."""
-    if operator == "+":
-        return a + b
-    elif operator == "-":
-        return a - b
-    elif operator == "*":
-        return a * b
-    elif operator == "/":
-        return a / b
-    else:
-        raise ValueError("Unsupported operator")
+def calculate(expression: str) -> float:
+    """Evaluate an arithmetic expression using +, -, *, / with standard operator precedence."""
+
+    allowed = "0123456789+-*/.() "
+
+    if not all(ch in allowed for ch in expression):
+        raise ValueError("Invalid expression")
+
+    return float(eval(expression))
 
 @mcp.tool
 def identify_shape(image_base64: str) -> str:
