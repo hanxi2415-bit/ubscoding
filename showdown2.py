@@ -6,6 +6,7 @@ GOAL_DELTA = 25
 
 rule_memory = {}
 seen_hands = set()
+decision_log = []
 
 
 def new_record():
@@ -40,9 +41,40 @@ def get_rule_data(table_rule):
         rule_memory[table_rule] = {
             "exact": {},
             "matchups": {},
-            "numbers": {}
+            "numbers": {},
+            "ratings": {},
+            "local_ratings": {},
+            "games": {},
+            "action_stats": {}
         }
-    return rule_memory[table_rule]
+    memory = rule_memory[table_rule]
+    memory.setdefault("ratings", {})
+    memory.setdefault("local_ratings", {})
+    memory.setdefault("games", {})
+    memory.setdefault("action_stats", {})
+    return memory
+
+
+def update_elo(memory, first, second, community, result):
+    first_rating = memory["ratings"].get(first, 1000.0)
+    second_rating = memory["ratings"].get(second, 1000.0)
+    expected = 1 / (1 + 10 ** ((second_rating - first_rating) / 400))
+    score = (result + 1) / 2
+    change = 32 * (score - expected)
+    memory["ratings"][first] = first_rating + change
+    memory["ratings"][second] = second_rating - change
+
+    first_key = community, first
+    second_key = community, second
+    first_local = memory["local_ratings"].get(first_key, first_rating)
+    second_local = memory["local_ratings"].get(second_key, second_rating)
+    local_expected = 1 / (1 + 10 ** ((second_local - first_local) / 400))
+    local_change = 40 * (score - local_expected)
+    memory["local_ratings"][first_key] = first_local + local_change
+    memory["local_ratings"][second_key] = second_local - local_change
+
+    memory["games"][first] = memory["games"].get(first, 0) + 1
+    memory["games"][second] = memory["games"].get(second, 0) + 1
 
 
 def update_rule_memory(data, opponent_seat):
@@ -84,10 +116,25 @@ def update_rule_memory(data, opponent_seat):
         add_result(exact, normalized_result)
         add_result(matchup, normalized_result)
 
-        your_record = memory["numbers"].setdefault(your_number, new_record())
-        opponent_record = memory["numbers"].setdefault(opponent_number, new_record())
-        add_result(your_record, result)
-        add_result(opponent_record, -result)
+        if your_number != opponent_number:
+            your_record = memory["numbers"].setdefault(your_number, new_record())
+            opponent_record = memory["numbers"].setdefault(opponent_number, new_record())
+            add_result(your_record, result)
+            add_result(opponent_record, -result)
+            update_elo(memory, your_number, opponent_number, community, result)
+
+        opponent_actions = [
+            action for action in hand.get("actions", [])
+            if action.get("seat") == opponent_seat
+        ]
+        was_aggressive = any(
+            action.get("action") in ("bet", "raise")
+            for action in opponent_actions
+        )
+        action_record = memory["action_stats"].setdefault(
+            opponent_number, {"aggressive": 0, "passive": 0}
+        )
+        action_record["aggressive" if was_aggressive else "passive"] += 1
 
 
 def estimate_matchup(table_rule, your_number, opponent_number, community):
@@ -100,22 +147,25 @@ def estimate_matchup(table_rule, your_number, opponent_number, community):
 
     exact = memory["exact"].get((community, low, high))
     if exact:
-        equity, samples = record_equity(exact)
-        estimates.append((equity, samples * 4))
+        samples = exact["wins"] + exact["losses"] + exact["ties"]
+        equity = (exact["wins"] + 0.5 * exact["ties"]) / samples
+        estimates.append((equity, samples * 12))
 
     overall = memory["matchups"].get((low, high))
     if overall:
         equity, samples = record_equity(overall)
         estimates.append((equity, samples))
 
-    low_record = memory["numbers"].get(low)
-    high_record = memory["numbers"].get(high)
-    if low_record or high_record:
-        low_strength, low_samples = record_equity(low_record or new_record())
-        high_strength, high_samples = record_equity(high_record or new_record())
-        strength_equity = 0.5 + 0.5 * (low_strength - high_strength)
-        strength_weight = (low_samples + high_samples) * 0.2
-        estimates.append((strength_equity, strength_weight))
+    low_rating = memory["ratings"].get(low, 1000.0)
+    high_rating = memory["ratings"].get(high, 1000.0)
+    low_local = memory["local_ratings"].get((community, low), low_rating)
+    high_local = memory["local_ratings"].get((community, high), high_rating)
+    low_blended = 0.7 * low_rating + 0.3 * low_local
+    high_blended = 0.7 * high_rating + 0.3 * high_local
+    rating_equity = 1 / (1 + 10 ** ((high_blended - low_blended) / 400))
+    rating_games = memory["games"].get(low, 0) + memory["games"].get(high, 0)
+    if rating_games:
+        estimates.append((rating_equity, min(6, rating_games * 0.5)))
 
     if not estimates:
         return 0.5, 0.0
@@ -127,18 +177,31 @@ def estimate_matchup(table_rule, your_number, opponent_number, community):
     return equity, confidence
 
 
-def estimate_equity(table_rule, your_number, community):
+def estimate_equity(table_rule, your_number, community, opponent_aggressive=False):
+    memory = get_rule_data(table_rule)
     total_equity = 0
     total_confidence = 0
+    total_weight = 0
 
     for opponent_number in range(1, 14):
         equity, confidence = estimate_matchup(
             table_rule, your_number, opponent_number, community
         )
-        total_equity += equity
-        total_confidence += confidence
+        weight = 1.0
+        if opponent_aggressive:
+            action_record = memory["action_stats"].get(opponent_number)
+            if action_record:
+                aggressive = action_record["aggressive"]
+                passive = action_record["passive"]
+                weight = (aggressive + 1) / (aggressive + passive + 2)
+            else:
+                weight = 0.5
 
-    return total_equity / 13, total_confidence / 13
+        total_equity += equity * weight
+        total_confidence += confidence * weight
+        total_weight += weight
+
+    return total_equity / total_weight, total_confidence / total_weight
 
 
 def calculate_pot_odds(pot, to_call):
@@ -178,7 +241,18 @@ def decide_move(data):
     total_hands = data.get("total_hands", 40)
     hands_left = max(0, total_hands - hand_number)
 
-    equity, confidence = estimate_equity(table_rule, your_number, community)
+    opponent_aggressive = any(
+        action.get("seat") == opponent_seat
+        and action.get("action") in ("bet", "raise")
+        and action.get("round") == data.get("round")
+        for action in data.get("current_hand_actions", [])
+    )
+    equity, confidence = estimate_equity(
+        table_rule,
+        your_number,
+        community,
+        opponent_aggressive
+    )
     pot_odds = calculate_pot_odds(pot, to_call)
 
     if chip_delta >= GOAL_DELTA:
@@ -208,11 +282,14 @@ def decide_move(data):
     if cheap_exploration and "call" in legal_actions:
         return {"action": "call"}
 
-    edge_required = 0.03
+    edge_required = 0.03 + 0.10 * (1 - confidence)
     if chip_delta < 0:
-        edge_required = 0
+        edge_required -= 0.03
     if hands_left <= 10 and chip_delta < GOAL_DELTA:
         edge_required -= 0.04
+
+    if opponent_aggressive and confidence < 0.6:
+        edge_required += 0.05
 
     if equity >= pot_odds + edge_required:
         should_raise = (
@@ -242,4 +319,44 @@ def decide_move(data):
 def move():
     data = request.get_json()
     decision = decide_move(data)
+
+    your_seat = data["your_seat"]
+    chip_delta = next(
+        player["chip_delta"] for player in data["players"]
+        if player["seat"] == your_seat
+    )
+    decision_log.append({
+        "match_id": data.get("match_id"),
+        "leg_number": data.get("leg_number"),
+        "hand_number": data.get("hand_number"),
+        "round": data.get("round"),
+        "table_rule": data["table_rule"],
+        "your_number": data["your_number"],
+        "community_number": data["community_number"],
+        "chip_delta": chip_delta,
+        "pot": data["pot"],
+        "to_call": data["to_call"],
+        "current_hand_actions": data.get("current_hand_actions", []),
+        "decision": decision
+    })
+    if len(decision_log) > 500:
+        del decision_log[:-500]
+
     return jsonify(decision)
+
+
+@app.route("/debug", methods=["GET"])
+def debug():
+    learned_rules = {}
+    for table_rule, memory in rule_memory.items():
+        learned_rules[table_rule] = {
+            "ratings": memory["ratings"],
+            "action_stats": memory["action_stats"],
+            "exact_matchups": len(memory["exact"]),
+            "cross_community_matchups": len(memory["matchups"])
+        }
+
+    return jsonify({
+        "rules": learned_rules,
+        "decisions": decision_log
+    })
