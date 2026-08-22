@@ -16,6 +16,9 @@ GRAPH_API_URL = os.environ.get(
 )
 graph_cache = {}
 
+import json
+from urllib.request import urlopen
+
 STUDY_URLS = [
     "https://tool-box-2591eaa24fa3.herokuapp.com/study-materials/1",
     "https://tool-box-2591eaa24fa3.herokuapp.com/study-materials/2",
@@ -30,36 +33,50 @@ study_cache = None
 def load_study_materials():
     global study_cache
 
-    if study_cache is not None:
+    if study_cache:
         return study_cache
 
-    study_cache = []
+    materials = []
 
     for url in STUDY_URLS:
-        with urlopen(url, timeout=8) as response:
-            data = json.loads(response.read().decode("utf-8"))
+        try:
+            with urlopen(url, timeout=8) as response:
+                raw = response.read().decode("utf-8")
 
-        if isinstance(data, str):
-            text = data
-        elif isinstance(data, dict):
-            text = (
-                data.get("content")
-                or data.get("text")
-                or data.get("body")
-                or data.get("document")
-                or json.dumps(data)
-            )
-        else:
-            text = str(data)
+            try:
+                data = json.loads(raw)
 
-        study_cache.append(text)
+                if isinstance(data, str):
+                    text = data
+                elif isinstance(data, dict):
+                    text = (
+                        data.get("content")
+                        or data.get("text")
+                        or data.get("body")
+                        or data.get("document")
+                        or raw
+                    )
+                else:
+                    text = raw
+            except json.JSONDecodeError:
+                text = raw
 
-    return study_cache
+            if text and text.strip():
+                materials.append(text.strip())
+
+        except Exception as e:
+            print("Study material error:", url, str(e))
+
+    study_cache = materials
+    return materials
 
 
 @mcp.tool()
 def retrieve(query: str) -> str:
     materials = load_study_materials()
+
+    if not materials:
+        return "Unable to load study materials."
 
     words = [
         word.lower().strip(".,?!:;()[]{}'\"")
@@ -79,9 +96,6 @@ def retrieve(query: str) -> str:
     result = ""
 
     for score, text in scored:
-        if score <= 0 and result:
-            break
-
         sentences = text.replace("\n", " ").split(".")
 
         relevant = []
@@ -93,23 +107,23 @@ def retrieve(query: str) -> str:
                 relevant.append(sentence.strip())
 
         for sentence in relevant:
+            if not sentence:
+                continue
+
             addition = sentence + ". "
 
             if len(result) + len(addition) > 900:
-                remaining = 900 - len(result)
-
-                if remaining > 0:
-                    result += addition[:remaining]
-
-                return result.strip()
+                return result.strip()[:900]
 
             result += addition
 
-    if not result:
-        best = scored[0][1]
-        return best[:900]
+        if len(result) >= 700:
+            break
 
-    return result.strip()
+    if not result:
+        return scored[0][1][:900]
+
+    return result.strip()[:900]
 
 def get_graph(map_id: str) -> dict:
     if map_id not in graph_cache:
