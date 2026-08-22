@@ -257,7 +257,8 @@ def decide_move(data):
     min_raise_to = data["min_raise_to"]
     max_raise_to = data["max_raise_to"]
     legal_actions = data["legal_actions"]
-    chip_delta = data["players"][your_seat]["chip_delta"]
+    your_player = next(p for p in data["players"] if p["seat"] == your_seat)
+    chip_delta = your_player["chip_delta"]
 
     equity, confidence = estimate_equity(codename, your_number, community_number)
     pot_odds = (to_call / (pot + to_call)) if to_call else 0.0
@@ -292,10 +293,20 @@ def decide_move(data):
     decision = None
 
     if equity > pot_odds + edge_required:
-        want_to_raise = equity > 0.75 and confidence > 0.15 and risk_mode != "preserve"
-        if want_to_raise:
+        want_to_size_up = equity > 0.75 and confidence > 0.15 and risk_mode != "preserve"
+        if to_call == 0:
+            # Nothing to call means it's on us to open the betting (or
+            # there's nothing left to do but check). "bet" is the legal
+            # action here, not "raise" -- try both so this works whichever
+            # the server sends. Still size smaller when we're not in
+            # full value-betting territory, rather than defaulting to a
+            # free check and giving up the edge entirely.
+            bet_multiple = max_pot_multiple if want_to_size_up else 0.5
+            bet_to = size_raise(pot, to_call, min_raise_to, max_raise_to, bet_multiple)
+            decision = try_actions(("bet", bet_to), ("raise", bet_to), ("check", None))
+        elif want_to_size_up:
             raise_to = size_raise(pot, to_call, min_raise_to, max_raise_to, max_pot_multiple)
-            decision = try_actions(("raise", raise_to), ("call", None))
+            decision = try_actions(("raise", raise_to), ("bet", raise_to), ("call", None))
         else:
             decision = try_actions(("call", None))
     elif (exploring and risk_mode != "preserve"
