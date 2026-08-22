@@ -130,17 +130,17 @@ def update_from_recent_hands(codename, recent_hands, your_seat, opponent_seat):
 # Equity estimation: empirical (Copeland-style) ranking, no assumed rule shape
 # ---------------------------------------------------------------------------
 
-def _copeland_scores(codename, community_number):
+def _copeland_scores_from_pairs(pairs):
     """score(n) = wins - losses across every number we've seen n face,
-    at this exact (codename, community_number). Numbers never observed
-    are simply absent from the dict."""
-    comm = RULE_STORE.get(codename, {}).get(str(community_number), {})
+    within the given set of pair records. Numbers never observed are
+    simply absent from the dict. Factored out so the same logic can run
+    over either a single community_number's records or a pooled set."""
     wins = {n: 0 for n in range(1, 14)}
     losses = {n: 0 for n in range(1, 14)}
     seen = set()
     n_obs = 0
 
-    for key, rec in comm.items():
+    for key, rec in pairs.items():
         lo, hi = (int(x) for x in key.split("_"))
         seen.add(lo)
         seen.add(hi)
@@ -155,33 +155,87 @@ def _copeland_scores(codename, community_number):
     return {n: wins[n] - losses[n] for n in seen}, n_obs
 
 
-def estimate_equity(codename, your_number, community_number):
-    """Returns (equity, confidence). confidence in [0,1] reflects how much
-    data backs the estimate; 0 means "we know nothing, treat as a coin
-    flip and don't trust it for sizing decisions."""
-    scores, n_obs = _copeland_scores(codename, community_number)
+def _copeland_scores(codename, community_number):
+    """Scores at this exact (codename, community_number) -- our most
+    specific, but sparsest, source of evidence."""
+    comm = RULE_STORE.get(codename, {}).get(str(community_number), {})
+    return _copeland_scores_from_pairs(comm)
 
-    if your_number not in scores or n_obs == 0:
-        return 0.5, 0.0
 
+def _global_copeland_scores(codename):
+    """Scores pooled across every community_number seen so far for this
+    codename. Many possible hidden rules don't depend on community_number
+    at all, and even for ones that do, this pooled ranking is still a
+    reasonable prior to shrink the local estimate toward -- so this is
+    cheap insurance either way, never a substitute for local evidence."""
+    pooled = {}
+    for comm in RULE_STORE.get(codename, {}).values():
+        for key, rec in comm.items():
+            dest = pooled.setdefault(key, {"low_wins": 0, "high_wins": 0, "ties": 0})
+            dest["low_wins"] += rec["low_wins"]
+            dest["high_wins"] += rec["high_wins"]
+            dest["ties"] += rec["ties"]
+    return _copeland_scores_from_pairs(pooled)
+
+
+def _equity_from_scores(scores, your_number):
+    """None means "your_number has no data in this score set" -- distinct
+    from an equity of 0.5, which is a real (if uninformative) estimate."""
+    if your_number not in scores:
+        return None
     my_score = scores[your_number]
     wins = 0.0
     knowns = 0
-    for opp in range(1, 14):
-        if opp not in scores:
+    for opp, opp_score in scores.items():
+        if opp == your_number:
             continue
         knowns += 1
-        opp_score = scores[opp]
         if my_score > opp_score:
             wins += 1
         elif my_score == opp_score:
             wins += 0.5
+    return wins / knowns if knowns else None
 
-    if knowns == 0:
+
+# How many local (this exact community_number) showdowns it takes before
+# local evidence outweighs the pooled cross-community prior. Small on
+# purpose: with ~40 hands split across up to 13 buckets, local data is
+# scarce, so the prior should dominate early but yield quickly once real
+# local evidence shows up.
+GLOBAL_SHRINK_K = 6
+
+
+def estimate_equity(codename, your_number, community_number):
+    """Returns (equity, confidence). confidence in [0,1] reflects how much
+    data backs the estimate; 0 means "we know nothing, treat as a coin
+    flip and don't trust it for sizing decisions."
+
+    Blends the community_number-specific ranking with a ranking pooled
+    across all community_numbers seen for this codename, weighted by how
+    much local evidence exists relative to GLOBAL_SHRINK_K. This is what
+    actually fixes the "confidence rarely climbs" problem noted above --
+    not a smarter learner, but not throwing away 12/13ths of the data by
+    treating each community_number as an unrelated ranking problem.
+    """
+    local_scores, local_n = _copeland_scores(codename, community_number)
+    global_scores, global_n = _global_copeland_scores(codename)
+
+    local_eq = _equity_from_scores(local_scores, your_number)
+    global_eq = _equity_from_scores(global_scores, your_number)
+
+    if local_eq is None and global_eq is None:
         return 0.5, 0.0
 
-    equity = wins / knowns
-    confidence = min(1.0, n_obs / CONFIDENCE_FULL_AT)
+    weight_local = local_n / (local_n + GLOBAL_SHRINK_K)
+    if local_eq is None:
+        equity = global_eq
+    elif global_eq is None:
+        equity = local_eq
+    else:
+        equity = weight_local * local_eq + (1 - weight_local) * global_eq
+
+    effective_n = local_n + (1 - weight_local) * global_n
+    confidence = min(1.0, effective_n / CONFIDENCE_FULL_AT)
     return equity, confidence
 
 
