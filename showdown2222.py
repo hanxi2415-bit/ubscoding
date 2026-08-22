@@ -1,24 +1,21 @@
 """
-Phase 2: table_rule is an opaque codename whose showdown rules are unknown
-and must be learned from observed showdowns during play.
+Phase 2 bot -- merges the blended rule-learning engine (exact-community +
+cross-community + Elo ratings, confidence-weighted) with disk persistence
+so what we learn about a codename survives process restarts between
+attempts. The guide states the same codename always means the same rule,
+across every match/attempt/phase, and retries replay the same leg order
+and rules -- so carrying the learned model forward is worth doing.
 
-Key design points (see accompanying explanation):
-  - We never assume a rule *shape*. We build a purely empirical strength
-    ranking over numbers 1-13, per (codename, community_number), from
-    actual showdown outcomes.
-  - Observations are persisted to disk, keyed by codename, because the
-    guide states the same codename always means the same rule, in every
-    match/attempt/phase, and retries replay the same leg order and rules.
-    ASSUMPTION TO VERIFY: this only helps if the server process (or at
-    least the disk) survives between attempts. If each attempt runs in a
-    fresh container, this degrades gracefully to "learn within the attempt
-    only" -- still correct, just less powerful.
-  - Betting has an explicit explore phase (pay small amounts to see
-    showdowns while the rule is still unknown) and an exploit phase (bet
-    on the learned ranking once there's enough data).
-  - Per-leg preservation: chip_delta resets to 0 every leg, and only
-    reaching +25 matters (100 pts flat, no bonus beyond) -- so once a leg
-    is at +25, minimize further risk for the rest of that leg.
+ASSUMPTION TO VERIFY: persistence only helps if the disk (or process)
+survives between attempts. If each attempt runs in a fresh container with
+no shared volume, this degrades gracefully to "learn within the attempt
+only" -- still correct, just without the cross-attempt benefit.
+
+Fix vs. the uploaded version: exact-community matchup equity was computed
+as a raw unsmoothed ratio (wins/samples), so a single observed showdown
+gave equity exactly 0.0 or 1.0 at 12x weight -- one hand could swing the
+whole read. It now goes through the same Laplace-smoothed record_equity()
+used for cross-community matchups.
 """
 
 import json
@@ -29,253 +26,298 @@ from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
-GOAL_DELTA = 25          # phase 2 per-leg target
-STORE_PATH = "rule_store.json"
+GOAL_DELTA = 25
+STORE_PATH = "rule_memory_store.json"
 _store_lock = threading.Lock()
 
-EXPLORATION_HAND_WINDOW = 8   # be willing to pay for info in a leg's first N hands
-EXPLORATION_MIN_OBS = 20      # ...or until we've seen this many showdowns for the rule
-CONFIDENCE_FULL_AT = 30        # showdowns at this community value for "fully confident"
+rule_memory = {}
+seen_hands = set()
+decision_log = []
 
 
 # ---------------------------------------------------------------------------
-# Persistence
+# Persistence -- rule_memory has tuple dict keys, which JSON can't hold
+# directly, so we encode/decode them around a plain-string-keyed form.
 # ---------------------------------------------------------------------------
 
-def _load_store():
-    if os.path.exists(STORE_PATH):
-        try:
-            with open(STORE_PATH) as f:
-                return json.load(f)
-        except (json.JSONDecodeError, OSError):
-            return {}
-    return {}
+def _encode_key(key):
+    if isinstance(key, tuple):
+        return "|".join(str(k) for k in key)
+    return str(key)
 
 
-def _save_store(store):
-    tmp = STORE_PATH + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(store, f)
-    os.replace(tmp, STORE_PATH)
+def _decode_key(raw, arity):
+    parts = [int(p) for p in raw.split("|")]
+    return parts[0] if arity == 1 else tuple(parts)
 
 
-RULE_STORE = _load_store()  # {codename: {community_number(str): {"lo_hi": {...}}}}
-
-# In-memory, per-process leg tracking (reset when we detect a new leg).
-_leg_state = {"table_rule": None, "leg_number": None, "seen_hand_numbers": set()}
-
-
-# ---------------------------------------------------------------------------
-# Learning from showdowns
-# ---------------------------------------------------------------------------
-
-def _pair_key(a, b):
-    lo, hi = (a, b) if a <= b else (b, a)
-    return f"{lo}_{hi}"
+def _serialize_memory(memory):
+    return {
+        "exact": {_encode_key(k): v for k, v in memory["exact"].items()},
+        "matchups": {_encode_key(k): v for k, v in memory["matchups"].items()},
+        "numbers": {_encode_key(k): v for k, v in memory["numbers"].items()},
+        "ratings": {_encode_key(k): v for k, v in memory["ratings"].items()},
+        "local_ratings": {_encode_key(k): v for k, v in memory["local_ratings"].items()},
+        "games": {_encode_key(k): v for k, v in memory["games"].items()},
+        "action_stats": {_encode_key(k): v for k, v in memory["action_stats"].items()},
+    }
 
 
-def _record_showdown(codename, community_number, n_a, n_b, outcome):
-    """outcome: 'a', 'b', or 'tie' -- which of the two revealed numbers won."""
-    lo, hi = (n_a, n_b) if n_a <= n_b else (n_b, n_a)
-    lo_won = (outcome == "a" and n_a == lo) or (outcome == "b" and n_b == lo)
-    hi_won = (outcome == "a" and n_a == hi) or (outcome == "b" and n_b == hi)
+def _deserialize_memory(raw):
+    return {
+        "exact": {_decode_key(k, 3): v for k, v in raw.get("exact", {}).items()},
+        "matchups": {_decode_key(k, 2): v for k, v in raw.get("matchups", {}).items()},
+        "numbers": {_decode_key(k, 1): v for k, v in raw.get("numbers", {}).items()},
+        "ratings": {_decode_key(k, 1): v for k, v in raw.get("ratings", {}).items()},
+        "local_ratings": {_decode_key(k, 2): v for k, v in raw.get("local_ratings", {}).items()},
+        "games": {_decode_key(k, 1): v for k, v in raw.get("games", {}).items()},
+        "action_stats": {_decode_key(k, 1): v for k, v in raw.get("action_stats", {}).items()},
+    }
 
+
+def _load_all():
+    global rule_memory, seen_hands
+    if not os.path.exists(STORE_PATH):
+        return
+    try:
+        with open(STORE_PATH) as f:
+            raw = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return
+
+    rule_memory = {
+        table_rule: _deserialize_memory(mem)
+        for table_rule, mem in raw.get("rule_memory", {}).items()
+    }
+    seen_hands = {tuple(item) for item in raw.get("seen_hands", [])}
+
+
+def _save_all():
     with _store_lock:
-        comm = RULE_STORE.setdefault(codename, {}).setdefault(str(community_number), {})
-        rec = comm.setdefault(_pair_key(lo, hi), {"low_wins": 0, "high_wins": 0, "ties": 0})
-        if outcome == "tie":
-            rec["ties"] += 1
-        elif lo_won:
-            rec["low_wins"] += 1
-        elif hi_won:
-            rec["high_wins"] += 1
+        payload = {
+            "rule_memory": {tr: _serialize_memory(m) for tr, m in rule_memory.items()},
+            "seen_hands": [list(item) for item in seen_hands],
+        }
+        tmp = STORE_PATH + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(payload, f)
+        os.replace(tmp, STORE_PATH)
 
 
-def update_from_recent_hands(codename, recent_hands, your_seat, opponent_seat):
-    """Pull any not-yet-seen showdowns out of recent_hands and record them.
-    Hands that ended without a reveal (someone folded) teach us nothing
-    about the rule, so we skip them but still mark them seen."""
+_load_all()
+
+
+# ---------------------------------------------------------------------------
+# Rule memory helpers
+# ---------------------------------------------------------------------------
+
+def new_record():
+    return {"wins": 0, "losses": 0, "ties": 0}
+
+
+def add_result(record, result):
+    if result > 0:
+        record["wins"] += 1
+    elif result < 0:
+        record["losses"] += 1
+    else:
+        record["ties"] += 1
+
+
+def record_equity(record):
+    """Laplace-smoothed (Beta(1,1) prior) equity estimate: starts at 0.5
+    with zero data, shrinks toward the observed rate as samples grow."""
+    total = record["wins"] + record["losses"] + record["ties"]
+    if total == 0:
+        return 0.5, 0
+    equity = (record["wins"] + 0.5 * record["ties"] + 1) / (total + 2)
+    return equity, total
+
+
+def normalize_matchup(first, second):
+    if first <= second:
+        return first, second, 1
+    return second, first, -1
+
+
+def get_rule_data(table_rule):
+    if table_rule not in rule_memory:
+        rule_memory[table_rule] = {
+            "exact": {},
+            "matchups": {},
+            "numbers": {},
+            "ratings": {},
+            "local_ratings": {},
+            "games": {},
+            "action_stats": {},
+        }
+    return rule_memory[table_rule]
+
+
+def update_elo(memory, first, second, community, result):
+    first_rating = memory["ratings"].get(first, 1000.0)
+    second_rating = memory["ratings"].get(second, 1000.0)
+    expected = 1 / (1 + 10 ** ((second_rating - first_rating) / 400))
+    score = (result + 1) / 2
+    change = 32 * (score - expected)
+    memory["ratings"][first] = first_rating + change
+    memory["ratings"][second] = second_rating - change
+
+    first_key = (community, first)
+    second_key = (community, second)
+    first_local = memory["local_ratings"].get(first_key, first_rating)
+    second_local = memory["local_ratings"].get(second_key, second_rating)
+    local_expected = 1 / (1 + 10 ** ((second_local - first_local) / 400))
+    local_change = 40 * (score - local_expected)
+    memory["local_ratings"][first_key] = first_local + local_change
+    memory["local_ratings"][second_key] = second_local - local_change
+
+    memory["games"][first] = memory["games"].get(first, 0) + 1
+    memory["games"][second] = memory["games"].get(second, 0) + 1
+
+
+def update_rule_memory(data, opponent_seat):
+    memory = get_rule_data(data["table_rule"])
+    your_seat = data["your_seat"]
+    match_id = data.get("match_id")
+    leg_number = data.get("leg_number")
+
     changed = False
-    for hand in recent_hands or []:
-        hn = hand.get("hand_number")
-        if hn is None or hn in _leg_state["seen_hand_numbers"]:
+    for hand in data.get("recent_hands", []):
+        hand_id = (match_id, leg_number, hand.get("hand_number"))
+        if hand_id in seen_hands:
             continue
-        _leg_state["seen_hand_numbers"].add(hn)
 
-        shown = hand.get("shown_numbers") or {}
-        my_shown = shown.get(str(your_seat))
-        opp_shown = shown.get(str(opponent_seat))
-        if my_shown is None or opp_shown is None:
+        shown = hand.get("shown_numbers", {})
+        your_number = shown.get(str(your_seat))
+        opponent_number = shown.get(str(opponent_seat))
+        if your_number is None or opponent_number is None:
             continue  # no showdown this hand
 
-        community = hand.get("community_number")
         winners = hand.get("winners", [])
-        if len(winners) >= 2:
-            outcome = "tie"
-        elif winners == [your_seat]:
-            outcome = "a"
-        elif winners == [opponent_seat]:
-            outcome = "b"
+        if your_seat in winners and opponent_seat in winners:
+            result = 0
+        elif your_seat in winners:
+            result = 1
+        elif opponent_seat in winners:
+            result = -1
         else:
-            outcome = "tie"
+            continue
 
-        _record_showdown(codename, community, my_shown, opp_shown, outcome)
+        seen_hands.add(hand_id)
         changed = True
+        community = hand["community_number"]
+        low, high, direction = normalize_matchup(your_number, opponent_number)
+        normalized_result = result * direction
+
+        exact = memory["exact"].setdefault((community, low, high), new_record())
+        matchup = memory["matchups"].setdefault((low, high), new_record())
+        add_result(exact, normalized_result)
+        add_result(matchup, normalized_result)
+
+        if your_number != opponent_number:
+            your_record = memory["numbers"].setdefault(your_number, new_record())
+            opponent_record = memory["numbers"].setdefault(opponent_number, new_record())
+            add_result(your_record, result)
+            add_result(opponent_record, -result)
+            update_elo(memory, your_number, opponent_number, community, result)
+
+        opponent_actions = [
+            action for action in hand.get("actions", [])
+            if action.get("seat") == opponent_seat
+        ]
+        was_aggressive = any(
+            action.get("action") in ("bet", "raise") for action in opponent_actions
+        )
+        action_record = memory["action_stats"].setdefault(
+            opponent_number, {"aggressive": 0, "passive": 0}
+        )
+        action_record["aggressive" if was_aggressive else "passive"] += 1
 
     if changed:
-        _save_store(RULE_STORE)
+        _save_all()
 
 
-# ---------------------------------------------------------------------------
-# Equity estimation: empirical (Copeland-style) ranking, no assumed rule shape
-# ---------------------------------------------------------------------------
+def estimate_matchup(table_rule, your_number, opponent_number, community):
+    if your_number == opponent_number:
+        return 0.5, 1.0
 
-def _copeland_scores_from_pairs(pairs):
-    """score(n) = wins - losses across every number we've seen n face,
-    within the given set of pair records. Numbers never observed are
-    simply absent from the dict. Factored out so the same logic can run
-    over either a single community_number's records or a pooled set."""
-    wins = {n: 0 for n in range(1, 14)}
-    losses = {n: 0 for n in range(1, 14)}
-    seen = set()
-    n_obs = 0
+    memory = get_rule_data(table_rule)
+    low, high, direction = normalize_matchup(your_number, opponent_number)
+    estimates = []
 
-    for key, rec in pairs.items():
-        lo, hi = (int(x) for x in key.split("_"))
-        seen.add(lo)
-        seen.add(hi)
-        if rec["low_wins"]:
-            wins[lo] += rec["low_wins"]
-            losses[hi] += rec["low_wins"]
-        if rec["high_wins"]:
-            wins[hi] += rec["high_wins"]
-            losses[lo] += rec["high_wins"]
-        n_obs += rec["low_wins"] + rec["high_wins"] + rec["ties"]
+    exact = memory["exact"].get((community, low, high))
+    if exact:
+        # FIX: use the same Laplace-smoothed estimator as the cross-community
+        # case. A raw ratio here meant a single showdown gave equity of
+        # exactly 0.0 or 1.0 at 12x weight -- one hand could swing the read.
+        equity, samples = record_equity(exact)
+        estimates.append((equity, samples * 12))
 
-    return {n: wins[n] - losses[n] for n in seen}, n_obs
+    overall = memory["matchups"].get((low, high))
+    if overall:
+        equity, samples = record_equity(overall)
+        estimates.append((equity, samples))
 
+    low_rating = memory["ratings"].get(low, 1000.0)
+    high_rating = memory["ratings"].get(high, 1000.0)
+    low_local = memory["local_ratings"].get((community, low), low_rating)
+    high_local = memory["local_ratings"].get((community, high), high_rating)
+    low_blended = 0.7 * low_rating + 0.3 * low_local
+    high_blended = 0.7 * high_rating + 0.3 * high_local
+    rating_equity = 1 / (1 + 10 ** ((high_blended - low_blended) / 400))
+    rating_games = memory["games"].get(low, 0) + memory["games"].get(high, 0)
+    if rating_games:
+        estimates.append((rating_equity, min(6, rating_games * 0.5)))
 
-def _copeland_scores(codename, community_number):
-    """Scores at this exact (codename, community_number) -- our most
-    specific, but sparsest, source of evidence."""
-    comm = RULE_STORE.get(codename, {}).get(str(community_number), {})
-    return _copeland_scores_from_pairs(comm)
-
-
-def _global_copeland_scores(codename):
-    """Scores pooled across every community_number seen so far for this
-    codename. Many possible hidden rules don't depend on community_number
-    at all, and even for ones that do, this pooled ranking is still a
-    reasonable prior to shrink the local estimate toward -- so this is
-    cheap insurance either way, never a substitute for local evidence."""
-    pooled = {}
-    for comm in RULE_STORE.get(codename, {}).values():
-        for key, rec in comm.items():
-            dest = pooled.setdefault(key, {"low_wins": 0, "high_wins": 0, "ties": 0})
-            dest["low_wins"] += rec["low_wins"]
-            dest["high_wins"] += rec["high_wins"]
-            dest["ties"] += rec["ties"]
-    return _copeland_scores_from_pairs(pooled)
-
-
-def _equity_from_scores(scores, your_number):
-    """None means "your_number has no data in this score set" -- distinct
-    from an equity of 0.5, which is a real (if uninformative) estimate."""
-    if your_number not in scores:
-        return None
-    my_score = scores[your_number]
-    wins = 0.0
-    knowns = 0
-    for opp, opp_score in scores.items():
-        if opp == your_number:
-            continue
-        knowns += 1
-        if my_score > opp_score:
-            wins += 1
-        elif my_score == opp_score:
-            wins += 0.5
-    return wins / knowns if knowns else None
-
-
-# How many local (this exact community_number) showdowns it takes before
-# local evidence outweighs the pooled cross-community prior. Small on
-# purpose: with ~40 hands split across up to 13 buckets, local data is
-# scarce, so the prior should dominate early but yield quickly once real
-# local evidence shows up.
-GLOBAL_SHRINK_K = 6
-
-
-def estimate_equity(codename, your_number, community_number):
-    """Returns (equity, confidence). confidence in [0,1] reflects how much
-    data backs the estimate; 0 means "we know nothing, treat as a coin
-    flip and don't trust it for sizing decisions."
-
-    Blends the community_number-specific ranking with a ranking pooled
-    across all community_numbers seen for this codename, weighted by how
-    much local evidence exists relative to GLOBAL_SHRINK_K. This is what
-    actually fixes the "confidence rarely climbs" problem noted above --
-    not a smarter learner, but not throwing away 12/13ths of the data by
-    treating each community_number as an unrelated ranking problem.
-    """
-    local_scores, local_n = _copeland_scores(codename, community_number)
-    global_scores, global_n = _global_copeland_scores(codename)
-
-    local_eq = _equity_from_scores(local_scores, your_number)
-    global_eq = _equity_from_scores(global_scores, your_number)
-
-    if local_eq is None and global_eq is None:
+    if not estimates:
         return 0.5, 0.0
 
-    weight_local = local_n / (local_n + GLOBAL_SHRINK_K)
-    if local_eq is None:
-        equity = global_eq
-    elif global_eq is None:
-        equity = local_eq
-    else:
-        equity = weight_local * local_eq + (1 - weight_local) * global_eq
-
-    effective_n = local_n + (1 - weight_local) * global_n
-    confidence = min(1.0, effective_n / CONFIDENCE_FULL_AT)
+    total_weight = sum(weight for _, weight in estimates)
+    low_equity = sum(equity * weight for equity, weight in estimates) / total_weight
+    equity = low_equity if direction == 1 else 1 - low_equity
+    confidence = min(1.0, total_weight / (total_weight + 6))
     return equity, confidence
 
 
-def _total_observations(codename):
-    return sum(
-        sum(rec["low_wins"] + rec["high_wins"] + rec["ties"] for rec in comm.values())
-        for comm in RULE_STORE.get(codename, {}).values()
-    )
+def estimate_equity(table_rule, your_number, community, opponent_aggressive=False):
+    memory = get_rule_data(table_rule)
+    total_equity = 0
+    total_confidence = 0
+    total_weight = 0
 
+    for opponent_number in range(1, 14):
+        equity, confidence = estimate_matchup(table_rule, your_number, opponent_number, community)
+        weight = 1.0
+        if opponent_aggressive:
+            action_record = memory["action_stats"].get(opponent_number)
+            if action_record:
+                aggressive = action_record["aggressive"]
+                passive = action_record["passive"]
+                weight = (aggressive + 1) / (aggressive + passive + 2)
+            else:
+                weight = 0.5
 
-def _observations_at(codename, community_number):
-    """Observation count for the exact (codename, community_number) bucket
-    -- the same granularity estimate_equity's confidence is computed at.
-    Using the codename-wide total here (as before) made this function
-    declare "done exploring" while confidence for the specific number
-    we're about to act on was still ~0, which flipped edge_required from
-    lenient to strict at the worst possible time."""
-    comm = RULE_STORE.get(codename, {}).get(str(community_number), {})
-    return sum(rec["low_wins"] + rec["high_wins"] + rec["ties"] for rec in comm.values())
+        total_equity += equity * weight
+        total_confidence += confidence * weight
+        total_weight += weight
 
-
-def in_exploration_phase(codename, hand_number, community_number):
-    return (hand_number <= EXPLORATION_HAND_WINDOW
-            or _observations_at(codename, community_number) < EXPLORATION_MIN_OBS)
+    return total_equity / total_weight, total_confidence / total_weight
 
 
 # ---------------------------------------------------------------------------
-# Risk mode / sizing (per-leg preservation at GOAL_DELTA)
+# Betting math
 # ---------------------------------------------------------------------------
 
-def get_risk_mode(chip_delta):
-    if chip_delta >= GOAL_DELTA:
-        return "preserve"
-    if chip_delta >= 0:
-        return "normal"
-    return "recover"
+def calculate_pot_odds(pot, to_call):
+    if to_call == 0:
+        return 0
+    return to_call / (pot + to_call)
 
 
-def size_raise(pot, to_call, min_raise_to, max_raise_to, pot_multiple):
-    target = int((pot + to_call) * pot_multiple)
+def raise_amount(pot, to_call, min_raise_to, max_raise_to, aggressive=False):
+    multiplier = 1.0 if aggressive else 0.6
+    target = int((pot + to_call) * multiplier)
     return max(min_raise_to, min(target, max_raise_to))
 
 
@@ -284,103 +326,124 @@ def size_raise(pot, to_call, min_raise_to, max_raise_to, pot_multiple):
 # ---------------------------------------------------------------------------
 
 def decide_move(data):
-    codename = data["table_rule"]
-    hand_number = data["hand_number"]
-    leg_number = data.get("leg_number")
-
-    # New leg? -> table_rule changes, leg_number changes, or hand_number
-    # restarts at 1. Reset our in-run "already processed" hand tracker so
-    # we don't skip hand_number==1 of a new leg because we saw a
-    # hand_number==1 earlier in a previous leg.
-    if (_leg_state["table_rule"] != codename
-            or _leg_state["leg_number"] != leg_number
-            or hand_number == 1):
-        _leg_state["table_rule"] = codename
-        _leg_state["leg_number"] = leg_number
-        _leg_state["seen_hand_numbers"] = set()
-
     your_seat = data["your_seat"]
     opponent_seat = next(p["seat"] for p in data["players"] if p["seat"] != your_seat)
+    update_rule_memory(data, opponent_seat)
 
-    update_from_recent_hands(codename, data.get("recent_hands", []), your_seat, opponent_seat)
-
+    table_rule = data["table_rule"]
     your_number = data["your_number"]
-    community_number = data["community_number"]
+    community = data["community_number"]
     pot = data["pot"]
     to_call = data["to_call"]
-    min_raise_to = data["min_raise_to"]
-    max_raise_to = data["max_raise_to"]
     legal_actions = data["legal_actions"]
-    your_player = next(p for p in data["players"] if p["seat"] == your_seat)
-    chip_delta = your_player["chip_delta"]
+    min_raise_to = data.get("min_raise_to")
+    max_raise_to = data.get("max_raise_to")
 
-    equity, confidence = estimate_equity(codename, your_number, community_number)
-    pot_odds = (to_call / (pot + to_call)) if to_call else 0.0
+    chip_delta = next(p["chip_delta"] for p in data["players"] if p["seat"] == your_seat)
+    hand_number = data.get("hand_number", 1)
+    total_hands = data.get("total_hands", 40)
+    hands_left = max(0, total_hands - hand_number)
 
-    risk_mode = get_risk_mode(chip_delta)
-    exploring = in_exploration_phase(codename, hand_number, community_number)
+    opponent_aggressive = any(
+        action.get("seat") == opponent_seat
+        and action.get("action") in ("bet", "raise")
+        and action.get("round") == data.get("round")
+        for action in data.get("current_hand_actions", [])
+    )
+    equity, confidence = estimate_equity(table_rule, your_number, community, opponent_aggressive)
+    pot_odds = calculate_pot_odds(pot, to_call)
 
-    base_edge = {"preserve": 0.10, "normal": 0.03, "recover": 0.0}[risk_mode]
-    uncertainty_penalty = (1 - confidence) * 0.10
+    if chip_delta >= GOAL_DELTA:
+        if to_call == 0 and "check" in legal_actions:
+            return {"action": "check"}
+        if confidence >= 0.7 and equity >= max(0.9, pot_odds + 0.15):
+            if "call" in legal_actions:
+                return {"action": "call"}
+        if "fold" in legal_actions:
+            return {"action": "fold"}
 
-    if exploring and risk_mode != "preserve":
-        # Cheap information is worth paying for early -- willing to call
-        # closer to break-even purely to see a showdown. Never applies once
-        # a leg's goal is already banked; no reason to pay for data then.
-        edge_required = max(0.0, base_edge - 0.08)
-    else:
-        edge_required = base_edge + uncertainty_penalty
+    if to_call == 0:
+        if confidence >= 0.35 and equity >= 0.72 and "raise" in legal_actions:
+            amount = raise_amount(pot, to_call, min_raise_to, max_raise_to, aggressive=equity >= 0.85)
+            return {"action": "raise", "amount": amount}
+        if "check" in legal_actions:
+            return {"action": "check"}
 
-    # Don't size up big on a read we don't trust yet, even if it looks great.
-    # Scale smoothly with confidence rather than a hard cliff -- with only
-    # 40 hands split across up to 13 community_number buckets, confidence
-    # rarely climbs high in a single leg, so a steep cutoff meant we almost
-    # never sized up even with a near-certain winner.
-    max_pot_multiple = 0.4 + 0.85 * confidence
+    cheap_exploration = confidence < 0.25 and hands_left > 12 and to_call <= max(2, pot * 0.15)
+    if cheap_exploration and "call" in legal_actions:
+        return {"action": "call"}
 
-    def try_actions(*ordered):
-        for action, amount in ordered:
-            if action in legal_actions:
-                return {"action": action} if amount is None else {"action": action, "amount": amount}
-        return None
+    edge_required = 0.03 + 0.10 * (1 - confidence)
+    if chip_delta < 0:
+        edge_required -= 0.03
+    if hands_left <= 10 and chip_delta < GOAL_DELTA:
+        edge_required -= 0.04
+    if opponent_aggressive and confidence < 0.6:
+        edge_required += 0.05
 
-    decision = None
+    if equity >= pot_odds + edge_required:
+        should_raise = confidence >= 0.4 and equity >= 0.76 and "raise" in legal_actions
+        if should_raise:
+            amount = raise_amount(
+                pot, to_call, min_raise_to, max_raise_to,
+                aggressive=hands_left <= 10 or equity >= 0.88,
+            )
+            return {"action": "raise", "amount": amount}
+        if "call" in legal_actions:
+            return {"action": "call"}
 
-    if equity > pot_odds + edge_required:
-        want_to_size_up = equity > 0.75 and confidence > 0.15 and risk_mode != "preserve"
-        if to_call == 0:
-            # Nothing to call means it's on us to open the betting (or
-            # there's nothing left to do but check). "bet" is the legal
-            # action here, not "raise" -- try both so this works whichever
-            # the server sends. Still size smaller when we're not in
-            # full value-betting territory, rather than defaulting to a
-            # free check and giving up the edge entirely.
-            bet_multiple = max_pot_multiple if want_to_size_up else 0.5
-            bet_to = size_raise(pot, to_call, min_raise_to, max_raise_to, bet_multiple)
-            decision = try_actions(("bet", bet_to), ("raise", bet_to), ("check", None))
-        elif want_to_size_up:
-            raise_to = size_raise(pot, to_call, min_raise_to, max_raise_to, max_pot_multiple)
-            decision = try_actions(("raise", raise_to), ("bet", raise_to), ("call", None))
-        else:
-            decision = try_actions(("call", None))
-    elif (exploring and risk_mode != "preserve"
-            and to_call > 0 and (to_call / max(pot, 1)) < 0.35):
-        # Marginal/unknown by our current model, but cheap enough that the
-        # information is worth the price.
-        decision = try_actions(("call", None))
-
-    if decision is None:
-        decision = try_actions(("check", None), ("fold", None), ("call", None))
-    if decision is None:
-        decision = {"action": legal_actions[0]}
-
-    return decision
+    if "check" in legal_actions:
+        return {"action": "check"}
+    if "fold" in legal_actions:
+        return {"action": "fold"}
+    if "call" in legal_actions:
+        return {"action": "call"}
+    return {"action": legal_actions[0]}
 
 
 @app.route("/move", methods=["POST"])
 def move():
     data = request.get_json()
-    return jsonify(decide_move(data))
+    decision = decide_move(data)
+
+    your_seat = data["your_seat"]
+    chip_delta = next(p["chip_delta"] for p in data["players"] if p["seat"] == your_seat)
+    decision_log.append({
+        "match_id": data.get("match_id"),
+        "leg_number": data.get("leg_number"),
+        "hand_number": data.get("hand_number"),
+        "round": data.get("round"),
+        "table_rule": data["table_rule"],
+        "your_number": data["your_number"],
+        "community_number": data["community_number"],
+        "chip_delta": chip_delta,
+        "pot": data["pot"],
+        "to_call": data["to_call"],
+        "current_hand_actions": data.get("current_hand_actions", []),
+        "decision": decision,
+    })
+    if len(decision_log) > 500:
+        del decision_log[:-500]
+
+    return jsonify(decision)
+
+
+@app.route("/debug", methods=["GET"])
+def debug():
+    learned_rules = {}
+    for table_rule, memory in rule_memory.items():
+        learned_rules[table_rule] = {
+            "ratings": memory["ratings"],
+            "action_stats": memory["action_stats"],
+            "exact_matchups": len(memory["exact"]),
+            "cross_community_matchups": len(memory["matchups"]),
+        }
+
+    return jsonify({
+        "store_path": os.path.abspath(STORE_PATH),
+        "rules": learned_rules,
+        "decisions": decision_log,
+    })
 
 
 if __name__ == "__main__":
