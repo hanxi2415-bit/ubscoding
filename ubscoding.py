@@ -1,15 +1,14 @@
 import base64
 import json
+from flask import Flask, request,jsonify
 
-## payload = str(input())
-payload = "ewoJImFkYXB0SW5wdXQiOiB7CgkJInVzZXIiOiB7CgkJCSJpZCI6ICJVNDIiLAoJCQkiZnVsbE5hbWUiOiAiSmFuZSBEb2UiCgkJfSwKCQkiYWN0aW9uIjogIkNSRUFURSIsCgkJImV0YWRhdGEiOiB7CgkJCSJwcmlvcml0eSI6ICJISUdIIgoJCX0KCX0KfQ=="
+app = Flask(__name__)
 
 
 def solve(payload: str):
     decoded = base64.b64decode(payload).decode("utf-8")
     data = json.loads(decoded)
 
-    # print(decoded)
 
     priority_map = {
         "LOW": 1,
@@ -28,9 +27,13 @@ def solve(payload: str):
         }
     }
 
-    #print(output)
+    return output
 
-    output_json = json.dumps(output, indent=4)
+@app.route("/solve", methods=["POST"])
+def solve_endpoint():
+    body = request.get_json()
+    payload = body["payload"]
 
-    #print(output_json)
-    return output_json
+    result = solve(payload)
+
+    return jsonify(result)
