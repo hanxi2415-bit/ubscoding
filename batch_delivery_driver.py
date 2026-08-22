@@ -7,10 +7,17 @@ from flask import Flask, request, jsonify
 app = Flask(__name__)
 
 
+def parse_time(value):
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
 def solve_case(data):
     start = tuple(data["start_coordinate"])
     end = tuple(data["end_coordinate"])
-    start_time = datetime.fromisoformat(data["start_time"].replace("Z", "+00:00"))
+    start_time = parse_time(data["start_time"])
 
     unreachable = {"total_duration_sec": None, "arrival_time": None, "path": []}
 
@@ -32,8 +39,8 @@ def solve_case(data):
         edge = obstruction["edge"]
         key = obstruction["edge_id"], tuple(edge["from"]), tuple(edge["to"])
         interval = (
-            datetime.fromisoformat(obstruction["start_time"].replace("Z", "+00:00")),
-            datetime.fromisoformat(obstruction["end_time"].replace("Z", "+00:00")),
+            parse_time(obstruction["start_time"]),
+            parse_time(obstruction["end_time"]),
             obstruction["speed_factor"],
         )
         blocks.setdefault(key, []).append(interval)

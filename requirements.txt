@@ -1,2 +1,5 @@
 Flask
 gunicorn
+fastmcp
+opencv-python-headless
+numpy
