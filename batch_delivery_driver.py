@@ -27,19 +27,13 @@ def solve_case(data):
 
     blocks = {}
     max_speeds = {}
-    horizon = 0.0
+    horizon = start_time
     for obstruction in data["obstructions"]:
         edge = obstruction["edge"]
         key = obstruction["edge_id"], tuple(edge["from"]), tuple(edge["to"])
         interval = (
-            (
-                datetime.fromisoformat(obstruction["start_time"].replace("Z", "+00:00"))
-                - start_time
-            ).total_seconds(),
-            (
-                datetime.fromisoformat(obstruction["end_time"].replace("Z", "+00:00"))
-                - start_time
-            ).total_seconds(),
+            datetime.fromisoformat(obstruction["start_time"].replace("Z", "+00:00")),
+            datetime.fromisoformat(obstruction["end_time"].replace("Z", "+00:00")),
             obstruction["speed_factor"],
         )
         blocks.setdefault(key, []).append(interval)
@@ -54,8 +48,6 @@ def solve_case(data):
     }
 
     def arrive(edge_id, a, b, duration, now):
-        if duration == 0:
-            return now
         left = duration
 
         key = edge_id, a, b
@@ -66,18 +58,18 @@ def solve_case(data):
             if begin <= now < finish and factor == 0:
                 return None
             if now < begin:
-                span = begin - now
+                span = (begin - now).total_seconds()
                 if left <= span:
-                    return now + left
+                    return now + timedelta(seconds=left)
                 left -= span
                 now = begin
-            span = finish - now
+            span = (finish - now).total_seconds()
             if factor and left <= span * factor:
-                return now + left / factor
+                return now + timedelta(seconds=left / factor)
             left -= span * factor
             now = finish
 
-        return now + left
+        return now + timedelta(seconds=left)
 
     def reverse_dist(optimistic=False):
         result = {end: 0}
@@ -131,7 +123,7 @@ def solve_case(data):
         if state in seen or best and estimate >= best[0]:
             continue
         seen.add(state)
-        now = elapsed
+        now = start_time + timedelta(seconds=elapsed)
 
         if node == end:
             best = elapsed, prefix(label)
@@ -143,7 +135,7 @@ def solve_case(data):
             for near, edge_id, duration in graph[node]:
                 arrival = arrive(edge_id, node, near, duration, now)
                 if arrival is not None and near in dist:
-                    new = arrival
+                    new = (arrival - start_time).total_seconds()
                     bound = new + lower[near]
                     if best is None or bound < best[0]:
                         serial += 1
