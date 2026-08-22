@@ -192,8 +192,20 @@ def _total_observations(codename):
     )
 
 
-def in_exploration_phase(codename, hand_number):
-    return hand_number <= EXPLORATION_HAND_WINDOW or _total_observations(codename) < EXPLORATION_MIN_OBS
+def _observations_at(codename, community_number):
+    """Observation count for the exact (codename, community_number) bucket
+    -- the same granularity estimate_equity's confidence is computed at.
+    Using the codename-wide total here (as before) made this function
+    declare "done exploring" while confidence for the specific number
+    we're about to act on was still ~0, which flipped edge_required from
+    lenient to strict at the worst possible time."""
+    comm = RULE_STORE.get(codename, {}).get(str(community_number), {})
+    return sum(rec["low_wins"] + rec["high_wins"] + rec["ties"] for rec in comm.values())
+
+
+def in_exploration_phase(codename, hand_number, community_number):
+    return (hand_number <= EXPLORATION_HAND_WINDOW
+            or _observations_at(codename, community_number) < EXPLORATION_MIN_OBS)
 
 
 # ---------------------------------------------------------------------------
@@ -251,7 +263,7 @@ def decide_move(data):
     pot_odds = (to_call / (pot + to_call)) if to_call else 0.0
 
     risk_mode = get_risk_mode(chip_delta)
-    exploring = in_exploration_phase(codename, hand_number)
+    exploring = in_exploration_phase(codename, hand_number, community_number)
 
     base_edge = {"preserve": 0.10, "normal": 0.03, "recover": 0.0}[risk_mode]
     uncertainty_penalty = (1 - confidence) * 0.10
@@ -265,7 +277,11 @@ def decide_move(data):
         edge_required = base_edge + uncertainty_penalty
 
     # Don't size up big on a read we don't trust yet, even if it looks great.
-    max_pot_multiple = 1.25 if confidence > 0.6 else 0.6
+    # Scale smoothly with confidence rather than a hard cliff -- with only
+    # 40 hands split across up to 13 community_number buckets, confidence
+    # rarely climbs high in a single leg, so a steep cutoff meant we almost
+    # never sized up even with a near-certain winner.
+    max_pot_multiple = 0.4 + 0.85 * confidence
 
     def try_actions(*ordered):
         for action, amount in ordered:
@@ -276,7 +292,7 @@ def decide_move(data):
     decision = None
 
     if equity > pot_odds + edge_required:
-        want_to_raise = equity > 0.75 and confidence > 0.4 and risk_mode != "preserve"
+        want_to_raise = equity > 0.75 and confidence > 0.15 and risk_mode != "preserve"
         if want_to_raise:
             raise_to = size_raise(pot, to_call, min_raise_to, max_raise_to, max_pot_multiple)
             decision = try_actions(("raise", raise_to), ("call", None))
