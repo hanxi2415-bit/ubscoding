@@ -72,23 +72,30 @@ def get_next_node(
     current: str,
     destination: str,
     visited: list[str] | None = None,
-    hops_left: int | None = None
+    hops_left: int | None = None,
+    hops_remaining: int | None = None
 ) -> str:
-    """ALWAYS use this tool for travel, routing, navigation, or any question
-    asking how to get from one node/location to another when a map_id is
-    provided.
+    """
+    ALWAYS use this tool for travel, routing, navigation, or any question
+    asking how to get from one node/location to another when a map_id is provided.
 
-    Example: "How can I get from HUB-Q to HUB-C? map_id: ..."
+    Example:
+    "How can I get from HUB-Q to HUB-C? map_id: ..."
     -> call this tool with current="HUB-Q", destination="HUB-C".
 
     Return exactly ONE next adjacent node on the cheapest valid directed route.
     Call this tool repeatedly after each move until the destination is reached.
 
     Route cost = directed edge weight + toll of every node entered.
-    Never revisit nodes listed in visited. If visited is omitted, treat it as
-    empty. If hops_left is provided, the route must reach the destination
-    within that many remaining edges, including the move being requested now.
+    Never revisit nodes listed in visited.
+
+    A remaining-hop limit may be supplied as either hops_left or
+    hops_remaining.
     """
+
+    if hops_left is None and hops_remaining is not None:
+        hops_left = hops_remaining
+
     graph = get_graph(map_id)
     adjacency = graph["adjacency"]
     tolls = graph.get("tolls", {})
@@ -98,9 +105,12 @@ def get_next_node(
 
     blocked = set(visited or [])
     blocked.discard(current)
-    max_hops = hops_left
-    if max_hops is None:
+
+    if hops_left is None:
         max_hops = max(0, len(adjacency) - len(blocked))
+    else:
+        max_hops = hops_left
+
     if max_hops <= 0:
         raise ValueError("No hops left")
 
@@ -109,11 +119,14 @@ def get_next_node(
 
     while queue:
         cost, hops_used, node, path = heapq.heappop(queue)
+
         if cost != best.get((node, hops_used)):
             continue
+
         if node == destination:
             return path[1]
-        if hops_used == max_hops:
+
+        if hops_used >= max_hops:
             continue
 
         for next_node, edge_weight in get_neighbours(adjacency, node):
@@ -122,15 +135,23 @@ def get_next_node(
 
             next_hops = hops_used + 1
             next_cost = cost + edge_weight + tolls.get(next_node, 0)
-            state = next_node, next_hops
+            state = (next_node, next_hops)
+
             if next_cost < best.get(state, float("inf")):
                 best[state] = next_cost
                 heapq.heappush(
                     queue,
-                    (next_cost, next_hops, next_node, path + [next_node])
+                    (
+                        next_cost,
+                        next_hops,
+                        next_node,
+                        path + [next_node]
+                    )
                 )
 
-    raise ValueError("Destination is not reachable within the hop limit")
+    raise ValueError(
+        "Destination is not reachable within the remaining hop limit"
+    )
 
 @mcp.tool()
 def get_name() -> str:
