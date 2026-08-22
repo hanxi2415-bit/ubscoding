@@ -5,6 +5,9 @@ import cv2
 import heapq
 import json
 import numpy as np
+import re
+import tiktoken
+from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlencode
 from urllib.request import urlopen
 
@@ -15,9 +18,6 @@ GRAPH_API_URL = os.environ.get(
     "https://tool-box-2591eaa24fa3.herokuapp.com/graph"
 )
 graph_cache = {}
-
-import json
-from urllib.request import urlopen
 
 STUDY_URLS = [
     "https://tool-box-2591eaa24fa3.herokuapp.com/study-materials/1",
@@ -30,98 +30,189 @@ STUDY_URLS = [
 study_cache = None
 
 
+def fetch_study_material(url):
+    try:
+        with urlopen(url, timeout=6) as response:
+            raw = response.read().decode("utf-8")
+
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            return raw.strip()
+
+        if isinstance(data, str):
+            return data.strip()
+        if isinstance(data, dict):
+            text = (
+                data.get("content")
+                or data.get("text")
+                or data.get("body")
+                or data.get("document")
+            )
+            return text.strip() if isinstance(text, str) else ""
+    except Exception:
+        return ""
+
+    return ""
+
+
 def load_study_materials():
     global study_cache
 
-    if study_cache:
+    if study_cache is not None:
         return study_cache
 
-    materials = []
+    with ThreadPoolExecutor(max_workers=len(STUDY_URLS)) as pool:
+        downloaded = list(pool.map(fetch_study_material, STUDY_URLS))
 
-    for url in STUDY_URLS:
-        try:
-            with urlopen(url, timeout=8) as response:
-                raw = response.read().decode("utf-8")
-
-            try:
-                data = json.loads(raw)
-
-                if isinstance(data, str):
-                    text = data
-                elif isinstance(data, dict):
-                    text = (
-                        data.get("content")
-                        or data.get("text")
-                        or data.get("body")
-                        or data.get("document")
-                        or raw
-                    )
-                else:
-                    text = raw
-            except json.JSONDecodeError:
-                text = raw
-
-            if text and text.strip():
-                materials.append(text.strip())
-
-        except Exception as e:
-            print("Study material error:", url, str(e))
-
-    study_cache = materials
-    return materials
+    study_cache = [text for text in downloaded if text]
+    return study_cache
 
 
 @mcp.tool()
 def retrieve(query: str) -> list[str]:
-    materials = load_study_materials()
+    """Return relevant passages within the exact o200k_base 900-token budget."""
+    encoding = tiktoken.get_encoding("o200k_base")
+    max_output_tokens = 900
 
-    if not materials:
-        return []
+    def normalized_words(value):
+        result = set()
+        for word in re.findall(r"[a-z0-9]+", value.lower()):
+            if len(word) <= 2:
+                continue
+            for suffix in ("ing", "ed", "es", "s"):
+                if word.endswith(suffix) and len(word) - len(suffix) >= 4:
+                    word = word[:-len(suffix)]
+                    break
+            result.add(word)
+        return result
 
-    words = [
-        word.lower().strip(".,?!:;()[]{}'\"")
-        for word in query.split()
-        if len(word) > 2
+    words = normalized_words(query)
+    words -= {
+        "the", "and", "for", "was", "were", "what", "when", "where",
+        "which", "who", "how", "from", "with", "about", "into", "exact"
+    }
+    original_words = set(words)
+
+    synonym_groups = [
+        {"motorman", "motormen", "driver", "operator"},
+        {"licensed", "certified", "qualified", "accredited"},
+        {"network", "transit", "transport", "rail", "service"},
+        {"many", "count", "total", "number", "headcount", "population", "enrolled"},
+        {"day", "date", "when"},
+        {"resolved", "fixed", "patched", "repaired"},
+        {"glitch", "fault", "issue", "bug", "regression", "failure"},
+        {"movement", "transition", "animation", "blending", "motion"},
+        {"lead", "leader", "director", "head", "chair"},
+        {"limit", "ceiling", "maximum", "max", "cap", "threshold"},
     ]
+    normalized_groups = [
+        set().union(*(normalized_words(word) for word in group))
+        for group in synonym_groups
+    ]
+    active_groups = [group for group in normalized_groups if words & group]
+    for group in active_groups:
+        words |= group
 
-    scored = []
+    def split_sections(text, limit=3200):
+        sections = re.split(r"(?=^#{1,3}\s+)", text, flags=re.MULTILINE)
+        sections = [section.strip() for section in sections if section.strip()]
+        if not sections:
+            sections = [text.strip()]
 
-    for text in materials:
-        lower = text.lower()
-        score = sum(lower.count(word) for word in words)
-        scored.append((score, text))
-
-    scored.sort(key=lambda x: x[0], reverse=True)
-
-    results = []
-    total_length = 0
-
-    for score, text in scored:
-        sentences = text.replace("\n", " ").split(".")
-
-        for sentence in sentences:
-            sentence = sentence.strip()
-
-            if not sentence:
+        chunks = []
+        for section in sections:
+            match = re.match(r"^#{1,3}\s+([^\n]+)", section)
+            heading = match.group(1).strip() if match else ""
+            if len(section) <= limit:
+                chunks.append((section, heading))
                 continue
 
-            sentence_lower = sentence.lower()
+            sentences = re.split(r"(?<=[.!?])\s+|\n+", section)
+            start = 0
+            while start < len(sentences):
+                size = 0
+                end = start
+                while end < len(sentences):
+                    added = len(sentences[end]) + 1
+                    if end > start and size + added > limit:
+                        break
+                    size += added
+                    end += 1
+                chunk = " ".join(sentences[start:end]).strip()
+                if start and heading:
+                    chunk = f"Section: {heading}\n{chunk}"
+                if chunk:
+                    chunks.append((chunk, heading))
+                if end == len(sentences):
+                    break
+                start = max(start + 1, end - 2)
+        return chunks
 
-            if any(word in sentence_lower for word in words):
-                passage = sentence + "."
+    candidates = []
+    documents = [split_sections(text) for text in load_study_materials()]
+    for document_index, chunks in enumerate(documents):
+        for chunk_index, (chunk, heading) in enumerate(chunks):
+            chunk_words = normalized_words(chunk)
+            matches = words & chunk_words
+            if not matches:
+                continue
+            original_matches = original_words & chunk_words
+            synonym_matches = matches - original_words
+            heading_matches = original_words & normalized_words(heading)
+            semantic_groups = sum(bool(group & chunk_words) for group in active_groups)
+            score = (
+                len(original_matches) * 20
+                + len(synonym_matches) * 6
+                + len(heading_matches) * 50
+                + semantic_groups * 12
+            )
+            candidates.append((score, document_index, chunk_index, chunk))
 
-                if total_length + len(passage) > 900:
-                    return results
+    candidates.sort(key=lambda item: (item[0], len(item[3])), reverse=True)
+    results = []
+    total_tokens = 0
 
-                results.append(passage)
-                total_length += len(passage)
+    def add_passage(passage):
+        nonlocal total_tokens
+        if not passage or passage in results or total_tokens >= max_output_tokens:
+            return
 
-        if total_length >= 700:
-            break
+        remaining = max_output_tokens - total_tokens
+        passage_tokens = encoding.encode(passage)
+        if len(passage_tokens) > remaining:
+            passage = encoding.decode(passage_tokens[:remaining]).strip()
+            passage_tokens = encoding.encode(passage)
 
-    if not results:
-        best = scored[0][1][:900]
-        return [best]
+        if passage:
+            results.append(passage)
+            total_tokens += len(passage_tokens)
+
+    if candidates:
+        _, best_document, best_chunk, best_passage = candidates[0]
+        add_passage(best_passage)
+
+        distance = 1
+        chunks = documents[best_document]
+        while total_tokens < max_output_tokens and (
+            best_chunk - distance >= 0 or best_chunk + distance < len(chunks)
+        ):
+            if best_chunk - distance >= 0:
+                add_passage(chunks[best_chunk - distance][0])
+            if total_tokens < max_output_tokens and best_chunk + distance < len(chunks):
+                add_passage(chunks[best_chunk + distance][0])
+            distance += 1
+
+        for _, _, _, passage in candidates[1:]:
+            if total_tokens >= max_output_tokens:
+                break
+            add_passage(passage)
+    else:
+        for chunks in documents:
+            for passage, _ in chunks:
+                if total_tokens >= max_output_tokens:
+                    break
+                add_passage(passage)
 
     return results
 

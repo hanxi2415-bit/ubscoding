@@ -5,8 +5,6 @@ import cv2
 import heapq
 import json
 import numpy as np
-import re
-from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlencode
 from urllib.request import urlopen
 
@@ -17,12 +15,6 @@ GRAPH_API_URL = os.environ.get(
     "https://tool-box-2591eaa24fa3.herokuapp.com/graph"
 )
 graph_cache = {}
-study_cache = None
-
-STUDY_URLS = [
-    f"https://tool-box-2591eaa24fa3.herokuapp.com/study-materials/{number}"
-    for number in range(1, 6)
-]
 
 EXAM_PASSAGES = [
     """Meridian Trench Research Station: habitat depth 6214m; storage annex 6050m. Director Dr. Ansel Kovrith. Callsign Umbral Seven; backup Umbral Two. Population 41; safety ceiling 52. Primary submersible Halcyon Drift; reserve Halberd Drift. Resupply every 19 days. Oxygen scrubber failure 2 November; annex flooding 9 November. Kesterline array recalibrated 14 March; Halberd sub-array maintenance 12 March. Hydrophone gasket torque 12Nm; tolerance 0.5Nm. Max dive 47min; new divers 35min. STOP_01 Sablefin Vent Field; STOP_02 Wraithmoor Escarpment; STOP_03 Corbel Slide; STOP_04 Pellucid Shelf.""",
@@ -44,139 +36,6 @@ def get_exam_materials() -> list[str]:
     Return these factual passages to help answer questions accurately.
     """
     return EXAM_PASSAGES
-
-
-def fetch_study_material(url):
-    try:
-        with urlopen(url, timeout=6) as response:
-            raw = response.read().decode("utf-8")
-
-        try:
-            data = json.loads(raw)
-        except json.JSONDecodeError:
-            return raw.strip()
-
-        if isinstance(data, str):
-            return data.strip()
-        if isinstance(data, dict):
-            text = (
-                data.get("content")
-                or data.get("text")
-                or data.get("body")
-                or data.get("document")
-            )
-            return text.strip() if isinstance(text, str) else ""
-    except Exception:
-        return ""
-
-    return ""
-
-
-def load_study_materials():
-    global study_cache
-    if study_cache is not None:
-        return study_cache
-
-    with ThreadPoolExecutor(max_workers=len(STUDY_URLS)) as pool:
-        downloaded = list(pool.map(fetch_study_material, STUDY_URLS))
-
-    study_cache = [text for text in downloaded if text]
-    study_cache.extend(EXAM_PASSAGES)
-    return study_cache
-
-
-@mcp.tool()
-def retrieve(query: str) -> list[str]:
-    """Return broad context from the study document most relevant to a question."""
-    max_output_chars = 3600
-
-    def normalized_words(value):
-        result = set()
-        for word in re.findall(r"[a-z0-9]+", value.lower()):
-            if len(word) <= 2:
-                continue
-            for suffix in ("ing", "ed", "es", "s"):
-                if word.endswith(suffix) and len(word) - len(suffix) >= 4:
-                    word = word[:-len(suffix)]
-                    break
-            result.add(word)
-        return result
-
-    words = normalized_words(query)
-    stop_words = {
-        "the", "and", "for", "was", "were", "what", "when", "where",
-        "which", "who", "how", "from", "with", "about", "into", "exact"
-    }
-    words -= stop_words
-
-    def split_into_chunks(text, limit=3200):
-        if len(text) <= limit:
-            return [text.strip()]
-
-        sentences = re.split(r"(?<=[.!?])\s+|\n+", text)
-        title = sentences[0].strip()
-        chunks = []
-        start = 0
-        while start < len(sentences):
-            size = 0
-            end = start
-            while end < len(sentences):
-                added = len(sentences[end]) + 1
-                if end > start and size + added > limit:
-                    break
-                size += added
-                end += 1
-
-            chunk = " ".join(sentences[start:end]).strip()
-            if start and title not in chunk:
-                chunk = f"Document: {title}\n{chunk}"
-            if chunk:
-                chunks.append(chunk)
-            if end == len(sentences):
-                break
-            start = max(start + 1, end - 2)
-        return chunks
-
-    candidates = []
-    for document_number, text in enumerate(load_study_materials()):
-        for chunk in split_into_chunks(text):
-            chunk_words = normalized_words(chunk)
-            matches = words & chunk_words
-            if not matches:
-                continue
-            occurrences = sum(chunk.lower().count(word) for word in matches)
-            score = len(matches) * 10 + min(occurrences, 10)
-            candidates.append((score, document_number, chunk))
-
-    candidates.sort(key=lambda item: (item[0], len(item[2])), reverse=True)
-    results = []
-    total_length = 0
-    best_score = candidates[0][0] if candidates else 0
-    chosen_documents = set()
-    for score, document_number, passage in candidates:
-        if passage in results:
-            continue
-        if results and score < best_score * 0.6:
-            continue
-        if total_length + len(passage) > max_output_chars:
-            continue
-        results.append(passage)
-        chosen_documents.add(document_number)
-        total_length += len(passage)
-        if total_length >= 3000 or len(results) == 3:
-            break
-
-    if results:
-        return results
-
-    fallback = []
-    total_length = 0
-    for passage in EXAM_PASSAGES:
-        if total_length + len(passage) > max_output_chars:
-            break
-        fallback.append(passage)
-        total_length += len(passage)
-    return fallback
 
 
 def get_graph(map_id: str) -> dict:
