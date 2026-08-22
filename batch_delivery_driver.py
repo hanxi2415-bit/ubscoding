@@ -93,7 +93,7 @@ def solve_case(d):
     while q:
         elapsed, node, path = heapq.heappop(q)
         state = node, round(elapsed, 9)
-        if state in seen or best and elapsed + dist[node] >= best[0]:
+        if state in seen or best and elapsed >= best[0]:
             continue
         seen.add(state)
         now = t0 + timedelta(seconds=elapsed)
@@ -129,5 +129,3 @@ def solve_api():
     return solve(request.get_data(as_text=True))
 
 
-if __name__ == "__main__":
-    app.run()
