@@ -7,16 +7,9 @@ app = Flask(__name__)
 # INTERNAL STATE
 # ============================================================
 
-# Stores transactions that have already been processed.
-# We will use this later to build the transaction graph.
 transactions_seen = []
-
-# Graph structure we will use later for detecting:
-# - extensions
-# - convergence
-# - returns
-# - multi-loops
 graph = {}
+return_nodes = {}
 
 
 # ============================================================
@@ -36,18 +29,14 @@ def health():
 
 @app.route("/ghost-chains/reset", methods=["POST"])
 def reset():
-    global transactions_seen, graph
-
     data = request.get_json()
 
     clear_transactions = data.get("clearTransactions", False)
 
     if clear_transactions:
-        # Clear all previously stored transactions
         transactions_seen.clear()
-
-        # Clear the transaction graph
         graph.clear()
+        return_nodes.clear()
 
     return jsonify({
         "clearTransactions": clear_transactions
@@ -55,73 +44,16 @@ def reset():
 
 
 # ============================================================
-# RISK CALCULATION
+# GRAPH HELPERS
 # ============================================================
-def get_all_ancestors(user):
-    """
-    Find every node that can reach `user`.
-    """
-
-    visited = set()
-
-    def visit(current):
-
-        for sender, recipients in graph.items():
-
-            if current in recipients and sender not in visited:
-                visited.add(sender)
-                visit(sender)
-
-    visit(user)
-
-    return visited
-
-
-def creates_convergence(from_user, to_user):
-    """
-    Check whether adding from_user -> to_user
-    creates convergence.
-    """
-
-    existing_senders = set()
-
-    for sender, recipients in graph.items():
-
-        if to_user in recipients:
-            existing_senders.add(sender)
-
-    if not existing_senders:
-        return False
-
-    new_sender_ancestors = get_all_ancestors(from_user)
-    new_sender_ancestors.add(from_user)
-
-    for existing_sender in existing_senders:
-
-        existing_sender_ancestors = get_all_ancestors(
-            existing_sender
-        )
-        existing_sender_ancestors.add(existing_sender)
-
-        if new_sender_ancestors.intersection(
-            existing_sender_ancestors
-        ):
-            return True
-
-    return False
-
 
 def can_reach(start, target):
-    """
-    Check whether `start` can reach `target`
-    through the existing transaction graph.
-    """
+    """Check whether start can reach target."""
 
     visited = set()
     stack = [start]
 
     while stack:
-
         current = stack.pop()
 
         if current == target:
@@ -138,91 +70,90 @@ def can_reach(start, target):
 
     return False
 
+
+def get_all_ancestors(user):
+    """Find every node that can reach user."""
+
+    visited = set()
+
+    def visit(current):
+        for sender, recipients in graph.items():
+
+            if current in recipients and sender not in visited:
+                visited.add(sender)
+                visit(sender)
+
+    visit(user)
+
+    return visited
+
+
 def creates_return(from_user, to_user):
-    """
-    Check whether adding from_user -> to_user
-    creates a return/cycle.
-    """
+    """Check whether this transaction creates a cycle."""
 
     return can_reach(to_user, from_user)
 
 
-def count_paths(start, target, max_paths=10):
-    """
-    Count the number of distinct paths from start to target
-    in the existing graph.
+def creates_convergence(from_user, to_user):
+    """Check whether this transaction creates convergence."""
 
-    max_paths prevents excessive searching in a large graph.
-    """
+    existing_senders = set()
 
-    path_count = 0
+    for sender, recipients in graph.items():
+        if to_user in recipients:
+            existing_senders.add(sender)
 
-    def dfs(current, visited):
+    if not existing_senders:
+        return False
 
-        nonlocal path_count
+    new_sender_ancestors = get_all_ancestors(from_user)
+    new_sender_ancestors.add(from_user)
 
-        if path_count >= max_paths:
-            return
+    for existing_sender in existing_senders:
 
-        if current == target:
-            path_count += 1
-            return
+        existing_sender_ancestors = get_all_ancestors(
+            existing_sender
+        )
 
-        for neighbour in graph.get(current, []):
+        existing_sender_ancestors.add(existing_sender)
 
-            if neighbour not in visited:
+        if new_sender_ancestors.intersection(
+            existing_sender_ancestors
+        ):
+            return True
 
-                dfs(
-                    neighbour,
-                    visited | {neighbour}
-                )
+    return False
 
-    dfs(start, {start})
 
-    return path_count
-
-return_nodes = {}
+# ============================================================
+# RISK CALCULATION
+# ============================================================
 
 def calculate_risk(tx):
 
     from_user = tx["fromUserId"]
     to_user = tx["toUserId"]
 
-    # --------------------------------
-    # 1. Is this a return?
-    # --------------------------------
-
+    # Multi-loop
     if creates_return(from_user, to_user):
 
-        # How many return paths have
-        # already reached this destination?
         previous_returns = return_nodes.get(to_user, 0)
 
         if previous_returns >= 1:
-            # This is another return to the
-            # same node -> multi-loop
             return 0.9
 
+        # First return
         return 0.6
 
-    # --------------------------------
-    # 2. Convergence
-    # --------------------------------
-
+    # Convergence
     if creates_convergence(from_user, to_user):
         return 0.3
 
-    # --------------------------------
-    # 3. Extension
-    # --------------------------------
-
+    # Extension
     if from_user in graph:
         return 0.1
 
-    # --------------------------------
-    # 4. Isolated
-    # --------------------------------
-
+    # Isolated
     return 0.0
 
 
@@ -239,57 +170,37 @@ def process_transactions():
 
     results = []
 
-    # IMPORTANT:
-    # Transactions must be processed sequentially.
+    # Process transactions sequentially
     for tx in transactions:
 
-        # Required fields
-        tx_id = tx["txId"]
-        from_user = tx["fromUserId"]
-        to_user = tx["toUserId"]
-        amount = tx["amount"]
-        created_at = tx["createdAt"]
-
-        # Optional fields
-        ip_address = tx.get("ipAddress")
-        device_id = tx.get("deviceId")
-
+        # Calculate risk BEFORE updating state
         risk_score = calculate_risk(tx)
 
+        # Store transaction
         transactions_seen.append(tx)
 
-        # If this transaction creates a return,
-        # remember that the destination has received
-        # a return path.
-        if creates_return(
-            tx["fromUserId"],
-            tx["toUserId"]
-        ):
-            to_user = tx["toUserId"]
+        from_user = tx["fromUserId"]
+        to_user = tx["toUserId"]
+
+        # Remember return paths
+        if creates_return(from_user, to_user):
 
             return_nodes[to_user] = (
                 return_nodes.get(to_user, 0) + 1
             )
 
         # Update graph
-        from_user = tx["fromUserId"]
-        to_user = tx["toUserId"]
-
         if from_user not in graph:
             graph[from_user] = []
 
         graph[from_user].append(to_user)
 
-        # ----------------------------------------
-        # Add result
-        # ----------------------------------------
-
+        # Build response
         results.append({
-            "txId": tx_id,
+            "txId": tx["txId"],
             "riskScore": risk_score
         })
 
-    # Preserve input ordering
     return jsonify({
         "transactions": results
     })
@@ -300,4 +211,7 @@ def process_transactions():
 # ============================================================
 
 if __name__ == "__main__":
-    app.run()
+    app.run(
+        host="0.0.0.0",
+        port=8080
+    )
