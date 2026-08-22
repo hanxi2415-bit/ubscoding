@@ -5,6 +5,8 @@ import cv2
 import heapq
 import json
 import numpy as np
+import re
+from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlencode
 from urllib.request import urlopen
 
@@ -15,6 +17,12 @@ GRAPH_API_URL = os.environ.get(
     "https://tool-box-2591eaa24fa3.herokuapp.com/graph"
 )
 graph_cache = {}
+study_cache = None
+
+STUDY_URLS = [
+    f"https://tool-box-2591eaa24fa3.herokuapp.com/study-materials/{number}"
+    for number in range(1, 6)
+]
 
 EXAM_PASSAGES = [
     """Meridian Trench Research Station: habitat depth 6214m; storage annex 6050m. Director Dr. Ansel Kovrith. Callsign Umbral Seven; backup Umbral Two. Population 41; safety ceiling 52. Primary submersible Halcyon Drift; reserve Halberd Drift. Resupply every 19 days. Oxygen scrubber failure 2 November; annex flooding 9 November. Kesterline array recalibrated 14 March; Halberd sub-array maintenance 12 March. Hydrophone gasket torque 12Nm; tolerance 0.5Nm. Max dive 47min; new divers 35min. STOP_01 Sablefin Vent Field; STOP_02 Wraithmoor Escarpment; STOP_03 Corbel Slide; STOP_04 Pellucid Shelf.""",
@@ -36,6 +44,88 @@ def get_exam_materials() -> list[str]:
     Return these factual passages to help answer questions accurately.
     """
     return EXAM_PASSAGES
+
+
+def fetch_study_material(url):
+    try:
+        with urlopen(url, timeout=6) as response:
+            raw = response.read().decode("utf-8")
+
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            return raw.strip()
+
+        if isinstance(data, str):
+            return data.strip()
+        if isinstance(data, dict):
+            text = (
+                data.get("content")
+                or data.get("text")
+                or data.get("body")
+                or data.get("document")
+            )
+            return text.strip() if isinstance(text, str) else ""
+    except Exception:
+        return ""
+
+    return ""
+
+
+def load_study_materials():
+    global study_cache
+    if study_cache is not None:
+        return study_cache
+
+    with ThreadPoolExecutor(max_workers=len(STUDY_URLS)) as pool:
+        downloaded = list(pool.map(fetch_study_material, STUDY_URLS))
+
+    study_cache = [text for text in downloaded if text]
+    study_cache.extend(EXAM_PASSAGES)
+    return study_cache
+
+
+@mcp.tool()
+def retrieve(query: str) -> list[str]:
+    """Retrieve passages relevant to an exam question."""
+    words = {
+        word for word in re.findall(r"[a-z0-9]+", query.lower())
+        if len(word) > 2
+    }
+    stop_words = {
+        "the", "and", "for", "was", "were", "what", "when", "where",
+        "which", "who", "how", "from", "with", "about", "into"
+    }
+    words -= stop_words
+
+    candidates = []
+    for text in load_study_materials():
+        sentences = re.split(r"(?<=[.!?])\s+|\n+", text)
+        for index, sentence in enumerate(sentences):
+            sentence_words = set(re.findall(r"[a-z0-9]+", sentence.lower()))
+            score = len(words & sentence_words)
+            if score:
+                start = max(0, index - 1)
+                end = min(len(sentences), index + 2)
+                passage = " ".join(sentences[start:end]).strip()
+                candidates.append((score, passage))
+
+    candidates.sort(key=lambda item: (item[0], len(item[1])), reverse=True)
+    results = []
+    total_length = 0
+    for _, passage in candidates:
+        if passage in results:
+            continue
+        if total_length + len(passage) > 1800:
+            continue
+        results.append(passage)
+        total_length += len(passage)
+        if len(results) == 6:
+            break
+
+    if results:
+        return results
+    return EXAM_PASSAGES[:2]
 
 
 def get_graph(map_id: str) -> dict:
