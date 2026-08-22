@@ -1,4 +1,5 @@
-from flask import Flask, request
+from flask import Flask, jsonify, request
+from bisect import bisect_right
 import json
 import heapq
 from datetime import datetime, timedelta
@@ -23,6 +24,7 @@ def solve_case(d):
         graph[b].append((a, *item))
 
     blocks = {}
+    max_speeds = {}
     horizon = t0
     for ob in d["obstructions"]:
         edge = ob["edge"]
@@ -33,19 +35,26 @@ def solve_case(d):
             ob["speed_factor"],
         )
         blocks.setdefault(key, []).append(interval)
+        max_speeds[key] = max(max_speeds.get(key, 1), ob["speed_factor"])
         horizon = max(horizon, interval[1])
 
     for intervals in blocks.values():
         intervals.sort()
+    block_ends = {
+        key: [finish for _, finish, _ in intervals]
+        for key, intervals in blocks.items()
+    }
 
     def arrive(edge_id, a, b, duration, now):
         if duration == 0:
             return now
         left = duration
 
-        for begin, finish, factor in blocks.get((edge_id, a, b), []):
-            if finish <= now:
-                continue
+        key = edge_id, a, b
+        intervals = blocks.get(key, ())
+        first = bisect_right(block_ends.get(key, ()), now)
+        for index in range(first, len(intervals)):
+            begin, finish, factor = intervals[index]
             if begin <= now < finish and factor == 0:
                 return None
             if now < begin:
@@ -62,19 +71,29 @@ def solve_case(d):
 
         return now + timedelta(seconds=left)
 
-    dist = {end: 0}
-    follow = {}
-    q = [(0, end)]
-    while q:
-        cost, node = heapq.heappop(q)
-        if cost != dist[node]:
-            continue
-        for near, edge_id, duration in graph[node]:
-            new = cost + duration
-            if new < dist.get(near, float("inf")):
-                dist[near] = new
-                follow[near] = node, edge_id
-                heapq.heappush(q, (new, near))
+    def reverse_dist(optimistic=False):
+        result = {end: 0}
+        next_step = {}
+        queue = [(0, end)]
+        while queue:
+            cost, node = heapq.heappop(queue)
+            if cost != result[node]:
+                continue
+            for near, edge_id, duration in graph[node]:
+                weight = duration
+                if optimistic:
+                    weight /= max_speeds.get((edge_id, near, node), 1)
+                new = cost + weight
+                if new < result.get(near, float("inf")):
+                    result[near] = new
+                    next_step[near] = node, edge_id
+                    heapq.heappush(queue, (new, near))
+        return result, next_step
+
+    # Base distances are exact after the final obstruction. Optimistic distances
+    # remain valid lower bounds even when a speed_factor is greater than one.
+    dist, follow = reverse_dist()
+    lower, _ = reverse_dist(optimistic=True)
 
     if start not in dist:
         return fail
@@ -86,28 +105,44 @@ def solve_case(d):
             path.append(edge_id)
         return path
 
+    def prefix(label):
+        path = []
+        while label:
+            label, edge_id = parents[label]
+            path.append(edge_id)
+        path.reverse()
+        return path
+
     best = None
-    q = [(0, start, [])]
+    serial = 0
+    parents = {0: None}
+    q = [(lower[start], 0, serial, start, 0)]
     seen = set()
 
     while q:
-        elapsed, node, path = heapq.heappop(q)
+        estimate, elapsed, _, node, label = heapq.heappop(q)
         state = node, round(elapsed, 9)
-        if state in seen or best and elapsed >= best[0]:
+        if state in seen or best and estimate >= best[0]:
             continue
         seen.add(state)
         now = t0 + timedelta(seconds=elapsed)
 
         if node == end:
-            best = elapsed, path
+            best = elapsed, prefix(label)
         elif now >= horizon:
-            best = elapsed + dist[node], path + tail(node)
+            candidate = elapsed + dist[node]
+            if best is None or candidate < best[0]:
+                best = candidate, prefix(label) + tail(node)
         else:
             for near, edge_id, duration in graph[node]:
                 arrival = arrive(edge_id, node, near, duration, now)
                 if arrival is not None and near in dist:
                     new = (arrival - t0).total_seconds()
-                    heapq.heappush(q, (new, near, path + [edge_id]))
+                    bound = new + lower[near]
+                    if best is None or bound < best[0]:
+                        serial += 1
+                        parents[serial] = label, edge_id
+                        heapq.heappush(q, (bound, new, serial, near, serial))
 
     if best is None:
         return fail
@@ -126,6 +161,5 @@ def solve(data: str) -> str:
 
 @app.route("/kan-cheong-delivery-driver", methods=["POST"])
 def solve_api():
-    return solve(request.get_data(as_text=True))
-
-
+    batch = request.get_json(force=True)
+    return jsonify({case_id: solve_case(case) for case_id, case in batch.items()})
