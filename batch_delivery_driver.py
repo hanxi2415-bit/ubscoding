@@ -89,7 +89,8 @@ def solve_case(data):
             for near, edge_id, duration in graph[node]:
                 weight = duration
                 if optimistic:
-                    weight /= max_speeds.get((edge_id, near, node), 1)
+                    max_speed = max_speeds.get((edge_id, near, node), 1)
+                    weight = max(0.0, duration / max_speed - 0.000001)
                 new = cost + weight
                 if new < result.get(near, float("inf")):
                     result[near] = new
