@@ -143,6 +143,11 @@ def retrieve(query: str) -> list[str]:
         {"stall", "stalled", "delay", "timeout", "slow"},
         {"texture", "memory", "streaming"},
         {"certification", "submission", "shipping", "release"},
+        {"people", "person", "engineer", "engineers", "staff", "staffing", "headcount"},
+        {"work", "working", "employ", "employed", "maintain", "maintains"},
+        {"simultaneous", "simultaneously", "concurrent", "concurrently", "same"},
+        {"core", "engine", "group", "team", "teams"},
+        {"roughly", "about", "approximately", "around"},
 
         {"shipment", "delivery", "consignment", "load", "batch"},
         {"grading", "grade", "quality", "classification", "rating"},
