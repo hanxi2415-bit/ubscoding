@@ -1,7 +1,7 @@
+
 import os
 import re
 import json
-from datetime import datetime
 from urllib.parse import urlencode
 from urllib.request import urlopen
 
@@ -10,6 +10,7 @@ from fastmcp import FastMCP
 mcp = FastMCP("UBS Stage 3")
 
 API_BASE = os.environ.get("TEAM_API_BASE", "https://tool-box-2591eaa24fa3.herokuapp.com").rstrip("/")
+INBOX_URL = os.environ.get("INBOX_URL")  # optional; supports .../inbox/{day} or a fixed endpoint
 
 
 # --------------------------
@@ -76,6 +77,90 @@ def get_location(person: str, day: str) -> tuple[int, int]:
     return int(payload["x"]), int(payload["y"])
 
 
+EMAILS_URL = os.environ.get("EMAILS_URL", f"{API_BASE}/emails")
+
+def fetch_inbox_from_url(day: str) -> str:
+    """
+    Fetch inbox text from /emails and normalize into one text blob
+    that parse_inbox_events can read.
+    """
+    target_day = normalize_day(day)
+
+    try:
+        with urlopen(EMAILS_URL, timeout=10) as resp:
+            raw = resp.read().decode("utf-8").strip()
+    except Exception:
+        return ""
+
+    # If endpoint already returns raw text, just pass through
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return raw
+
+    # Normalize JSON into newline-separated message text
+    messages = []
+    if isinstance(data, list):
+        messages = data
+    elif isinstance(data, dict):
+        # common wrappers
+        for k in ("emails", "items", "messages", "data"):
+            if isinstance(data.get(k), list):
+                messages = data[k]
+                break
+        if not messages:
+            # maybe single message object
+            messages = [data]
+
+    parts = []
+    for msg in messages:
+        if isinstance(msg, str):
+            text = msg
+        elif isinstance(msg, dict):
+            # try likely fields
+            text = (
+                msg.get("body")
+                or msg.get("content")
+                or msg.get("text")
+                or msg.get("raw")
+                or ""
+            )
+            # if structured only, synthesize minimal lines for parser
+            if not text:
+                resp_val = str(msg.get("response", "")).upper().strip()
+                when_val = str(msg.get("when", "")).strip()
+                if resp_val and when_val:
+                    text = f"Response: {resp_val}\nWhen: {when_val}"
+        else:
+            text = ""
+
+        if not text:
+            continue
+
+        # Keep only emails mentioning the target day to reduce noise
+        # (parser also re-checks day)
+        if re.search(rf"\b{target_day}\b", text, flags=re.IGNORECASE):
+            parts.append(text)
+
+    return "\n\n".join(parts)
+
+
+def resolve_inbox_text(day: str, inbox_text: str | None) -> str:
+    text = (inbox_text or "").strip()
+
+    # Real invitation content passed directly
+    if "Response:" in text and "When:" in text:
+        return text
+
+    # Otherwise fetch canonical emails
+    fetched = fetch_inbox_from_url(day)
+    if fetched:
+        return fetched
+
+    # fallback
+    return text
+
+
 # --------------------------
 # Inbox parser (android calendar)
 # --------------------------
@@ -125,6 +210,7 @@ def parse_inbox_events(inbox_text: str, day: str) -> tuple[list[tuple[int, int]]
                 tentative_busy.append((s, e))
             # DECLINED => no constraint
 
+    # Soft behavior: if text is unstructured (e.g., user prompt), just no self-events.
     return accepted_busy, tentative_busy
 
 
@@ -274,7 +360,9 @@ def find_best_meeting_window(
       2) if none exists, earliest window overlapping only tentative android commitments.
     Returns {"start":"HH:MM","end":"HH:MM"}.
     """
-    st, en = pick_best_window(day, participants, range_start, range_end, duration_minutes, inbox_text)
+    day = normalize_day(day)
+    actual_inbox = resolve_inbox_text(day, inbox_text)
+    st, en = pick_best_window(day, participants, range_start, range_end, duration_minutes, actual_inbox)
     return {"start": st, "end": en}
 
 
@@ -315,6 +403,8 @@ def plan_outing(
     if len(my_position) != 2:
         raise ValueError("my_position must be [x, y].")
 
+    actual_inbox = resolve_inbox_text(day, inbox_text)
+
     # 1) Must be the correct meeting window first
     meeting_start, meeting_end = pick_best_window(
         day=day,
@@ -322,7 +412,7 @@ def plan_outing(
         range_start=range_start,
         range_end=range_end,
         duration_minutes=duration_minutes,
-        inbox_text=inbox_text
+        inbox_text=actual_inbox
     )
 
     # 2) Venue must be open in hour beginning at meeting end (duration_minutes window)
