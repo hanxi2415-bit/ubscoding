@@ -137,7 +137,7 @@ def get_name() -> str:
     """Return the agent's name."""
     return "BabyBot"
 
-@mcp.tool
+@mcp.tool()
 def calculate(expression: str) -> float:
     """Evaluate an arithmetic expression using +, -, *, / with standard operator precedence."""
 
@@ -148,7 +148,7 @@ def calculate(expression: str) -> float:
 
     return float(eval(expression))
 
-@mcp.tool
+@mcp.tool()
 def identify_shape(image_base64: str) -> str:
     """Identify whether a base64-encoded PNG contains a triangle, rectangle, or circle."""
 
