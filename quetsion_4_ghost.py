@@ -140,7 +140,8 @@ def calculate_risk(tx):
         previous_returns = return_nodes.get(to_user, 0)
 
         if previous_returns >= 1:
-            return 0.9
+            score = min(0.8 + previous_returns * 0.05, 1)
+            return score
 
         # First return
         return 0.6
