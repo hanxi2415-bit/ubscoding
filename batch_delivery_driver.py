@@ -2,7 +2,7 @@ from flask import Flask, jsonify, request
 from bisect import bisect_right
 import json
 import heapq
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 app = Flask(__name__)
 
@@ -150,7 +150,9 @@ def solve_case(d):
     duration, path = best
     duration = round(duration, 9)
     duration = int(duration) if duration.is_integer() else duration
-    arrival = (t0 + timedelta(seconds=duration)).isoformat().replace("+00:00", "Z")
+    arrival = (
+        t0 + timedelta(seconds=duration)
+    ).astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
     return {"total_duration_sec": duration, "arrival_time": arrival, "path": path}
 
 
